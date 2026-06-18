@@ -148,9 +148,7 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
     let mut buf = String::new();
     loop {
         buf.clear();
-        let bytes_read = reader
-            .read_line(&mut buf)
-            .context("reading log line")?;
+        let bytes_read = reader.read_line(&mut buf).context("reading log line")?;
         if bytes_read == 0 {
             break;
         }
@@ -220,7 +218,15 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
     // We've reached the tail of the matched set when no older matching
     // events were ever discarded during the scan AND we did not stop
     // early because of the caller's cursor cap.
-    let at_end = !dropped_older && !stopped_early;
+    //
+    // The empty-page guard matters: when `until_line_offset` already
+    // sits at or past every line in the file but no events matched the
+    // caller's filter, the page is empty and `next_cursor_line_offset`
+    // is `None`. Without the empty-page override a caller would see
+    // `at_end = false` with no way to advance — they'd loop or 500.
+    // An empty page means "nothing more to paginate here", regardless
+    // of how we got there.
+    let at_end = !dropped_older && !stopped_early || events.is_empty();
 
     Ok(LogPage {
         events,
@@ -805,6 +811,59 @@ mod tests {
             "until_line_offset=0 must skip every line and yield an empty page"
         );
         assert!(page.next_cursor_line_offset.is_none());
-        assert!(!page.at_end, "page at file start must still report more available");
+        assert!(
+            page.at_end,
+            "empty page (regardless of cursor state) must report at_end so \
+             callers stop paginating instead of looping on a cursor that \
+             cannot advance"
+        );
+    }
+
+    /// Regression test: when `until_line_offset` sits at or past every
+    /// line in the file but the filter excludes all events, the page is
+    /// empty **and** the caller's cursor has nothing further to point
+    /// at. Reporting `at_end = false` here would deadlock callers that
+    /// page until `at_end` is true — they would loop forever on a page
+    /// that never produces events and never advances the cursor.
+    #[test]
+    fn empty_page_with_filter_excludes_everything_reports_at_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let mut events = Vec::new();
+        for index in 0..4 {
+            let mut event = make_event("test", None);
+            event.timestamp = format!("2026-05-15T19:00:0{index}.000Z");
+            events.push(event);
+        }
+        write_jsonl(&path, &events);
+
+        // First read: filter excludes everything, no cursor set, full
+        // file scanned.
+        let filter = LogFilter {
+            action: Some("does-not-exist".into()),
+            ..Default::default()
+        };
+        let page = load_page(&path, &filter, 10).unwrap();
+        assert!(page.events.is_empty());
+        assert!(
+            page.at_end,
+            "empty page after a full-file scan must report at_end"
+        );
+        assert!(page.next_cursor_line_offset.is_none());
+
+        // Second read: same filter, but a cursor set mid-file. The
+        // reader stops at the cursor without matching anything; the
+        // page is still empty and `at_end` must still be true.
+        let filter_with_cursor = LogFilter {
+            action: Some("does-not-exist".into()),
+            until_line_offset: Some(50),
+            ..Default::default()
+        };
+        let page2 = load_page(&path, &filter_with_cursor, 10).unwrap();
+        assert!(page2.events.is_empty());
+        assert!(
+            page2.at_end,
+            "empty page under an until_line_offset cursor must also report at_end"
+        );
     }
 }
