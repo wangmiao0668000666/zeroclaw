@@ -3848,8 +3848,25 @@ mod tests {
     /// Regression test for issue #7694: when two rows in the same
     /// session share an `updated_at` boundary timestamp, `list()` must
     /// still return them deterministically (not randomly swap order on
-    /// each read). We force the tie by writing from the same `Instant`
-    /// bucket via two writes back-to-back with no observable sleep.
+    /// each read).
+    ///
+    /// Implementation note: `Local::now()` in `store()` carries
+    /// nanosecond precision on this host (e.g. `…15.007463284+08:00`),
+    /// so two back-to-back `store()` calls naturally land in distinct
+    /// `updated_at` buckets and never tie. To exercise the tie path
+    /// deterministically we seed the rows through the public `store()`
+    /// API and then collapse both `updated_at` values to a single
+    /// RFC 3339 timestamp via a direct SQL update through the public
+    /// `connection()` accessor. The `list()` calls themselves still go
+    /// through the public `Memory` trait surface.
+    ///
+    /// Scope note: this test verifies stable read-ordering when a tie
+    /// has been forced. A query-level secondary sort key (e.g.
+    /// `ORDER BY updated_at DESC, rowid ASC`) that would make
+    /// tied-timestamp ordering *guaranteed* rather than
+    /// implementation-defined is a production-logic change and is
+    /// tracked separately — see PR #7921's follow-up notes for the
+    /// reader-cursor side of the same family of issues.
     #[tokio::test]
     async fn sqlite_session_metadata_ordering_ties_are_deterministic() {
         let (_tmp, mem) = temp_sqlite();
@@ -3860,8 +3877,35 @@ mod tests {
             .await
             .unwrap();
 
+        // Force both rows to share the exact same `created_at` /
+        // `updated_at` value. Without this, two back-to-back `store()`
+        // calls on this host produce distinct nanosecond timestamps
+        // and the test would never exercise the tie path. We pin both
+        // columns because `list()` exposes `m.created_at` as the
+        // entry's `timestamp` while ordering by `m.updated_at`.
+        let tied_ts = "2026-06-19T00:00:00.000000000+00:00";
+        {
+            let conn = mem.connection().lock();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1, updated_at = ?1 \
+                 WHERE key IN (?2, ?3)",
+                rusqlite::params![tied_ts, "tie-x", "tie-y"],
+            )
+            .unwrap();
+        }
+
         let first = mem.list(None, Some("sess-tie")).await.unwrap();
         assert_eq!(first.len(), 2);
+
+        // Lock in that a tie really occurred. Without this, the test
+        // degrades into a generic "stable order" check and the
+        // function name overstates what it covers.
+        assert_eq!(
+            first[0].timestamp, first[1].timestamp,
+            "expected both rows to share the forced updated_at"
+        );
+        assert_eq!(first[0].timestamp, tied_ts);
+
         // Capture the order once.
         let snapshot: Vec<String> = first.iter().map(|e| e.key.clone()).collect();
 
