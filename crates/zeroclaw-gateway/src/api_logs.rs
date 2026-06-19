@@ -54,6 +54,15 @@ pub struct LogsResponse {
     /// exist. Prefer [`Self::next_cursor_line_offset`] — it is
     /// independent of id ordering and avoids the lexicographic
     /// `until_id` tie-break that can drop earlier-written events.
+    ///
+    /// Deprecated since 0.8.0; tracked for removal in
+    /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.
+    #[deprecated(
+        since = "0.8.0",
+        note = "tie-breaks by lexicographic id and can silently drop events; \
+                use `next_cursor_line_offset` / `until_line_offset` instead. \
+                Removal tracked in zeroclaw-labs/zeroclaw#8012."
+    )]
     pub next_cursor: Option<(String, String)>,
     /// Byte offset past the last event on this page. Pass back as
     /// `?until_line_offset=` on the next request to resume without
@@ -84,6 +93,7 @@ fn attribution_keys_for_response() -> Vec<String> {
     keys
 }
 
+#[allow(deprecated)] // we still forward the legacy cursor for backwards compat
 pub async fn handle_api_logs(
     State(state): State<AppState>,
     headers: HeaderMap,

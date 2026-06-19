@@ -1240,6 +1240,14 @@ rpc_type! {
 rpc_type! {
     pub struct LogsQueryResult {
         pub events: Vec<serde_json::Value>,
+        /// Legacy cursor. Deprecated since 0.8.0; tracked for removal in
+        /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.
+        #[deprecated(
+            since = "0.8.0",
+            note = "tie-breaks by lexicographic id and can silently drop events; \
+                    use `next_cursor_line_offset` / `until_line_offset` instead. \
+                    Removal tracked in zeroclaw-labs/zeroclaw#8012."
+        )]
         pub next_cursor: Option<(String, String)>,
         /// Byte offset past the last event on this page. Callers should
         /// pass this back as `until_line_offset` on the next request to

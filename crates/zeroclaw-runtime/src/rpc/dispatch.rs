@@ -3538,6 +3538,7 @@ impl RpcDispatcher {
         to_result(LogsSubscribeResult { subscribed: true })
     }
 
+    #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
         let p: LogsQueryParams = parse_params(params)?;
 

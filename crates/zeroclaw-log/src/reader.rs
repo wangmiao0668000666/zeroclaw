@@ -80,6 +80,17 @@ pub struct LogPage {
     /// ordering diverges from file insertion order. Prefer
     /// [`Self::next_cursor_line_offset`] when available — it is
     /// independent of id ordering.
+    ///
+    /// Deprecated since 0.8.0; tracked for removal in
+    /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>. New code
+    /// should read [`Self::next_cursor_line_offset`] and pass it back
+    /// as [`LogFilter::until_line_offset`].
+    #[deprecated(
+        since = "0.8.0",
+        note = "tie-breaks by lexicographic id and can silently drop events; \
+                use `next_cursor_line_offset` / `until_line_offset` instead. \
+                Removal tracked in zeroclaw-labs/zeroclaw#8012."
+    )]
     pub next_cursor: Option<(String, String)>,
     /// Byte offset past the OLDEST event on this page (the event in
     /// file order that is earliest among this page's matches). Pass
@@ -108,6 +119,7 @@ pub struct LogPage {
 /// **and** makes same-timestamp pagination deterministic regardless of
 /// id ordering — the byte offset is the source of truth for "where I
 /// left off", independent of how ids sort lexicographically.
+#[allow(deprecated)] // we still populate `next_cursor` for backwards compat
 pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPage> {
     let limit = limit.clamp(1, 10_000);
 
@@ -226,6 +238,28 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
     // `at_end = false` with no way to advance — they'd loop or 500.
     // An empty page means "nothing more to paginate here", regardless
     // of how we got there.
+    //
+    // Two specific scenarios this resolves (raised during review):
+    //
+    // 1. Log file rotated/truncated under us, with the caller's cursor
+    //    pointing past the new EOF. `stopped_early = true` (the cursor
+    //    cap fires on the first byte we read), `events.is_empty() = true`
+    //    (we never matched anything). Formula resolves to
+    //    `at_end = true` — a caller paging-until-at-end stops cleanly
+    //    instead of looping on the same empty page forever. The empty
+    //    page also returns `next_cursor_line_offset = None`, so a
+    //    caller that doesn't trust `at_end` still has nothing to page
+    //    on.
+    //
+    // 2. `stopped_early = true` AND the cursor cap falls in the
+    //    middle of the file (caller is mid-pagination) AND no events
+    //    in the scanned window matched the filter. The formula still
+    //    resolves to `at_end = true` via `events.is_empty()`. Is this
+    //    safe? Yes — the next page would re-scan the prefix up to the
+    //    same `until_line_offset` cap with the same filter and again
+    //    match nothing. Returning `at_end = true` short-circuits that
+    //    infinite re-scan. Callers that want to break out of a
+    //    no-match window can do so by clearing the filter.
     let at_end = !dropped_older && !stopped_early || events.is_empty();
 
     Ok(LogPage {
@@ -486,6 +520,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // legacy cursor is the subject under test
     fn cursor_pagination_returns_older_pages() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
@@ -525,6 +560,7 @@ mod tests {
     /// matching file order. Out-of-scope: reader behavior when id
     /// ordering diverges from file order — flagged for follow-up.
     #[test]
+    #[allow(deprecated)] // legacy cursor is the subject under test
     fn same_timestamp_pagination_walks_all_events_exactly_once() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
@@ -593,6 +629,7 @@ mod tests {
     /// Without the id tie-break, the same event would appear in two
     /// consecutive pages.
     #[test]
+    #[allow(deprecated)] // legacy cursor is the subject under test
     fn same_timestamp_cursor_does_not_duplicate_boundary_event() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
