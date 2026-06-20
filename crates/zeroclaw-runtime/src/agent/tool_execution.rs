@@ -641,4 +641,26 @@ mod tests {
             "tool_search in a mixed approval batch must still force sequential execution"
         );
     }
+
+    #[test]
+    fn non_search_non_approval_batch_remains_parallel_eligible() {
+        // Control case (issue #7686 acceptance criterion #4): a batch that
+        // contains neither `tool_search` nor any approval-gated tool must
+        // remain parallel-eligible. This pins the default-true return so a
+        // future refactor that turns the policy helper into a defensive
+        // always-serial function is caught here, not at a much later
+        // integration test. Issue #7686 only requires the inverse direction
+        // (tool_search ⇒ serial); this test makes the "default still works"
+        // half of the contract explicit in `tool_execution.rs` itself rather
+        // than relying solely on the pre-existing control test in `loop_.rs`.
+        let calls = vec![
+            parsed_tool_call("file_read"),
+            parsed_tool_call("memory_recall"),
+        ];
+
+        assert!(
+            should_execute_tools_in_parallel(&calls, None),
+            "non-tool_search, non-approval batch must remain parallel-eligible (default branch)"
+        );
+    }
 }
