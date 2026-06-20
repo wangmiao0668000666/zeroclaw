@@ -1691,4 +1691,231 @@ mod tests {
             1.0
         );
     }
+
+    // ----------------------------------------------------------
+    // Responses-wire option propagation (#7690)
+    //
+    // Pinned regression: non-default options configured on
+    // `OpenAiResponsesModelProvider` (via the `with_*` builders) must
+    // survive into `ResponsesApiRequest` at the wire boundary. Without
+    // these tests, a future refactor could silently drop
+    // `max_tokens` / `reasoning_effort` / `responses_url` / tools /
+    // instructions / temperature while existing smoke tests still pass.
+    //
+    // Test seam: `build_request` is private but reachable via `super::*`
+    // from this `#[cfg(test)] mod tests`. We construct the provider with
+    // the non-default option, call `build_request` with minimal
+    // required arguments, serialize to JSON, and assert each option is
+    // present in the wire body (or, for URL, in the field
+    // `responses_url`).
+    //
+    // No live network dependency. No provider credentials required.
+    // ----------------------------------------------------------
+
+    #[test]
+    fn responses_request_propagates_max_tokens_when_set() {
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(2048));
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert_eq!(
+            json.get("max_output_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(2048),
+            "max_tokens configured on the provider must survive into max_output_tokens on the wire body"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_max_tokens_when_unset() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        assert!(
+            provider.max_tokens.is_none(),
+            "fresh provider must default max_tokens to None"
+        );
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("max_output_tokens").is_none()
+                || json
+                    .get("max_output_tokens")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "unset max_tokens must not surface as a wire-bound integer (skipped via skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn responses_request_propagates_reasoning_effort_when_set() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None)
+            .with_reasoning_effort(Some("high".to_string()));
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "o3",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        let reasoning = json
+            .get("reasoning")
+            .expect("reasoning_effort must populate the `reasoning` object");
+        assert_eq!(
+            reasoning.get("effort").and_then(serde_json::Value::as_str),
+            Some("high"),
+            "with_reasoning_effort(Some(\"high\")) must surface as reasoning.effort = \"high\" on the wire body"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_reasoning_when_unset() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        assert!(
+            provider.reasoning_effort.is_none(),
+            "fresh provider must default reasoning_effort to None"
+        );
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("reasoning").is_none()
+                || json
+                    .get("reasoning")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "unset reasoning_effort must not surface as a wire-bound object (skipped via skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn responses_request_propagates_instructions_and_temperature_and_model() {
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", Some("https://api.example.test/v1"), None);
+        let req = provider.build_request(
+            Some("You are a careful assistant.".to_string()),
+            vec![serde_json::json!({"role": "user", "content": "summarize"})],
+            None,
+            "gpt-5-mini",
+            Some(0.3),
+            true,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert_eq!(
+            json.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-5-mini"),
+            "model argument must reach the wire body verbatim"
+        );
+        assert_eq!(
+            json.get("instructions").and_then(serde_json::Value::as_str),
+            Some("You are a careful assistant."),
+            "non-None instructions argument must reach the wire body"
+        );
+        assert_eq!(
+            json.get("temperature").and_then(serde_json::Value::as_f64),
+            Some(0.3),
+            "temperature argument must reach the wire body as f64"
+        );
+        assert_eq!(
+            json.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "stream argument must reach the wire body as bool"
+        );
+    }
+
+    #[test]
+    fn responses_request_propagates_tool_choice_and_parallel_when_tools_present() {
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(1024));
+        let tools = Some(vec![ResponsesToolSpec {
+            kind: "function".to_string(),
+            name: "lookup_weather".to_string(),
+            description: "Look up the weather for a city.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }),
+            strict: true,
+        }]);
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "weather?"})],
+            tools,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert_eq!(
+            json.get("tool_choice").and_then(serde_json::Value::as_str),
+            Some("auto"),
+            "with tools present, wire body must carry tool_choice = \"auto\""
+        );
+        assert_eq!(
+            json.get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "with tools present, wire body must carry parallel_tool_calls = true"
+        );
+        let wire_tools = json
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("tools must be a JSON array on the wire body");
+        assert_eq!(
+            wire_tools.len(),
+            1,
+            "exactly one tool spec must reach the wire body"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_tool_choice_and_parallel_when_tools_absent() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("tool_choice").is_none()
+                || json
+                    .get("tool_choice")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "no tools → tool_choice must be omitted (skipped via skip_serializing_if)"
+        );
+        assert!(
+            json.get("parallel_tool_calls").is_none()
+                || json
+                    .get("parallel_tool_calls")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "no tools → parallel_tool_calls must be omitted (skipped via skip_serializing_if)"
+        );
+    }
 }
