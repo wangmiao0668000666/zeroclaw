@@ -1711,6 +1711,39 @@ mod tests {
     //
     // No live network dependency. No provider credentials required.
     // ----------------------------------------------------------
+    //
+    // Supported options (asserted below with `propagates_*_when_set`
+    // tests, and pinned for `None` propagation with `omits_*_when_unset`
+    // tests):
+    //
+    // | Provider builder        | Wire field on `ResponsesApiRequest` | Notes                                  |
+    // |-------------------------|--------------------------------------|----------------------------------------|
+    // | `with_max_tokens`       | `max_output_tokens`                  | Omits when `None`                      |
+    // | `with_reasoning_effort` | `reasoning.effort`                   | Omits when `None`                      |
+    // | (model arg)             | `model`                              | Always present                         |
+    // | (instructions arg)      | `instructions`                       | Omits when `None`                      |
+    // | (temperature arg)       | `temperature`                        | Force-1.0 for o1/o3/gpt-5-*; else pass |
+    // | (stream arg)            | `stream`                             | Always present (bool)                  |
+    // | (tools arg)             | `tools`                              | Omits when `None`                      |
+    // | (tool_choice arg)       | `tool_choice`                        | Omits when `None` AND tools absent     |
+    // | (parallel arg)          | `parallel_tool_calls`                | Omits when `None` AND tools absent     |
+    //
+    // Intentionally NOT propagated by the responses wire (these would
+    // be silently dropped — listed here as known-unsupported for this
+    // code path so future maintainers do not "fix" them by quietly
+    // adding fields the OpenAI Responses API does not accept):
+    //
+    // - `top_p` — Responses API has no `top_p`; callers who need it
+    //   must use the legacy `OpenAiModelProvider` (chat-completions
+    //   path).
+    // - `frequency_penalty` / `presence_penalty` — Responses API
+    //   rejects both. Same fallback path as `top_p`.
+    // - `stop` / `seed` — not exposed by
+    //   `OpenAiResponsesModelProvider`'s `with_*` builders; add to this
+    //   list if/when a `with_seed` builder is introduced.
+    // - `logprobs` — Responses API uses `top_logprobs` instead; not
+    //   propagated. Same fallback path as `top_p`.
+    // ----------------------------------------------------------
 
     #[test]
     fn responses_request_propagates_max_tokens_when_set() {
