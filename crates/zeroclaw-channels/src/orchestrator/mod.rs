@@ -18710,7 +18710,7 @@ This is an example JSON object for profile settings."#;
     /// the unified `ActiveChannelAliases` gate AND the channel-level
     /// `enabled = true` check, in the same way `doctor_channels` and
     /// `start_channels` use it after Phase 2.
-    #[allow(dead_code)] // only used by the #[cfg(feature = "channel-nostr")] tests below
+    #[cfg(feature = "channel-nostr")]
     fn resolve_nostr_active(config: &Config) -> Vec<String> {
         let active = ActiveChannelAliases::compute(config);
         config
