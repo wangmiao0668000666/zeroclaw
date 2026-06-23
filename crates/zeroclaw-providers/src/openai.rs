@@ -885,10 +885,22 @@ pub struct OpenAiResponsesModelProvider {
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
     /// Extra HTTP headers to include on every request issued through
-    /// `http_client` / `streaming_client`. Per-request `.header(...)` calls
-    /// (e.g. `Authorization`, `Accept: text/event-stream`) take precedence
-    /// over `default_headers`, so an `Authorization` entry here overrides
-    /// the provider's built-in bearer credential.
+    /// `http_client` / `streaming_client`. Each entry is merged into the
+    /// reqwest `Client` builder's `default_headers`.
+    ///
+    /// **Authorization is reserved.** An entry whose key matches
+    /// `Authorization` (case-insensitive) is dropped at
+    /// `build_default_headers` time with a WARN log. The provider's
+    /// built-in bearer credential (configured via the `credential`
+    /// constructor argument and emitted per-request as
+    /// `Authorization: Bearer <key>`) is authoritative; operator auth
+    /// overrides via `extra_headers` are not supported on this code path
+    /// because reqwest 0.12 *appends* per-request headers on top of
+    /// `default_headers` rather than substituting them, which would
+    /// produce two `Authorization` values on the wire and cause most
+    /// servers to reject or pick non-deterministically. To rotate the
+    /// bearer credential, pass it through the `credential` constructor
+    /// argument instead.
     extra_headers: std::collections::HashMap<String, String>,
 }
 
@@ -976,12 +988,32 @@ impl OpenAiResponsesModelProvider {
     }
 
     /// Build the default-header set from `extra_headers`. Returns an empty
-    /// `HeaderMap` when the provider has no extra headers configured. Invalid
-    /// header names / values are logged at WARN and skipped (matching the
-    /// `OpenAiCompatibleModelProvider::http_client` policy).
+    /// `HeaderMap` when the provider has no extra headers configured.
+    ///
+    /// Reserved keys (case-insensitive `Authorization`) are dropped with
+    /// a WARN log: the provider's built-in bearer credential is
+    /// authoritative, and an operator-set `Authorization` would produce
+    /// two header values on the wire (reqwest 0.12 appends per-request
+    /// headers on top of `default_headers`, it does not substitute them).
+    ///
+    /// Invalid header names / values are also logged at WARN and skipped
+    /// (matching the `OpenAiCompatibleModelProvider::http_client` policy).
     fn build_default_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (key, value) in &self.extra_headers {
+            if key.eq_ignore_ascii_case("authorization") {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "header": key,
+                            "reason": "reserved_authorization_overridden_by_provider_credential",
+                        })),
+                    "Dropping reserved 'Authorization' entry from extra_headers; built-in provider credential is authoritative. Rotate the credential via the 'credential' constructor argument instead."
+                );
+                continue;
+            }
             match (
                 HeaderName::from_bytes(key.as_bytes()),
                 HeaderValue::from_str(value),
@@ -1005,13 +1037,12 @@ impl OpenAiResponsesModelProvider {
 
     /// HTTP client for non-streaming responses requests: total timeout from
     /// `self.timeout_secs` plus a 10s connect timeout, plus any
-    /// `extra_headers` merged into `default_headers` (per-request
-    /// `.header(...)` calls win, so this provider's per-request
-    /// `Authorization: Bearer ...` takes precedence over an
-    /// `Authorization` entry in `extra_headers` — except that an
-    /// `Authorization` in `default_headers` would shadow a per-request
-    /// `Authorization` in reqwest; we therefore do NOT add the built-in
-    /// `Authorization` to `default_headers`, only `extra_headers`).
+    /// `extra_headers` (with reserved keys dropped — see
+    /// `build_default_headers`) merged into reqwest `default_headers`.
+    /// The per-request `.header("Authorization", ...)` calls in
+    /// `chat` / `chat_with_system` / `stream_chat` are the sole source of
+    /// the `Authorization` value on the wire; the built-in provider
+    /// credential is therefore authoritative on this code path.
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
@@ -1444,6 +1475,129 @@ mod tests {
         assert!(
             default_headers.get("X-Good-Value").is_some(),
             "X-Good-Value must be present in the HeaderMap"
+        );
+    }
+
+    // ----------------------------------------------------------
+    // Issue #7690 follow-up: Authorization header precedence (option A).
+    //
+    // Per the review on PR #8037 (singlerider, 2026-06-23): reqwest 0.12
+    // *appends* per-request headers on top of `default_headers`, it does
+    // not substitute them. An `Authorization` entry in `extra_headers`
+    // therefore produces two `Authorization` values on the wire and
+    // most servers reject or pick non-deterministically. The fix is to
+    // drop the reserved key (case-insensitive) from the merge and emit
+    // a WARN. The provider's built-in bearer credential (set via the
+    // `credential` constructor argument and emitted per-request as
+    // `Authorization: Bearer <key>`) stays authoritative.
+    //
+    // These tests pin the precedence at the `build_default_headers`
+    // surface (the only HeaderMap observable test seam — reqwest
+    // `Client` does not expose its internal `default_headers`).
+    // ----------------------------------------------------------
+
+    #[test]
+    fn build_default_headers_drops_authorization_in_favor_of_builtin() {
+        // Operator sets an `Authorization` in `extra_headers`. The
+        // builder must drop it (case-insensitive) and emit a WARN. The
+        // built-in provider credential (set via the `credential`
+        // constructor argument) is the sole `Authorization` source on
+        // the wire.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer operator-override".to_string(),
+        );
+        let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None)
+            .with_extra_headers(headers);
+        let default_headers = p.build_default_headers();
+        assert!(
+            default_headers.get("Authorization").is_none(),
+            "operator-set Authorization must be dropped from default_headers so the built-in provider credential stays authoritative on the wire"
+        );
+        assert_eq!(
+            default_headers.len(),
+            0,
+            "the only configured extra_headers entry was the reserved Authorization and must not appear in the resulting HeaderMap"
+        );
+    }
+
+    #[test]
+    fn build_default_headers_drops_authorization_case_insensitively() {
+        // `authorization`, `AUTHORIZATION`, `Authorization` must all be
+        // dropped — reqwest stores header names lowercased internally,
+        // so the public contract is "any case". Verify all three.
+        for variant in [
+            "Authorization",
+            "authorization",
+            "AUTHORIZATION",
+            "AuThOrIzAtIoN",
+        ] {
+            let mut headers = std::collections::HashMap::new();
+            headers.insert(variant.to_string(), "Bearer x".to_string());
+            let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None)
+                .with_extra_headers(headers);
+            let default_headers = p.build_default_headers();
+            assert!(
+                default_headers.get("Authorization").is_none(),
+                "case variant {variant:?} must be dropped from default_headers (case-insensitive)"
+            );
+            assert_eq!(
+                default_headers.len(),
+                0,
+                "case variant {variant:?} must produce an empty HeaderMap (only reserved Authorization configured)"
+            );
+        }
+    }
+
+    #[test]
+    fn build_default_headers_preserves_non_authorization_extra_headers() {
+        // Reserved-key drop is *narrow*: only `Authorization` (and its
+        // case variants) is reserved. Other custom headers flow through
+        // unchanged. This pins that the drop does not accidentally widen
+        // to a deny-list of common headers like `Cookie`, `X-Api-Key`,
+        // etc.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer operator-override".to_string(),
+        );
+        headers.insert("X-Title".to_string(), "zeroclaw".to_string());
+        headers.insert(
+            "HTTP-Referer".to_string(),
+            "https://example.com".to_string(),
+        );
+        headers.insert("X-Trace-Id".to_string(), "trace-123".to_string());
+        let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None)
+            .with_extra_headers(headers);
+        let default_headers = p.build_default_headers();
+        assert_eq!(
+            default_headers.len(),
+            3,
+            "only the reserved Authorization is dropped; the three other custom headers must flow through"
+        );
+        assert!(
+            default_headers.get("Authorization").is_none(),
+            "Authorization must not appear in default_headers regardless of other entries"
+        );
+        assert_eq!(
+            default_headers.get("X-Title").and_then(|v| v.to_str().ok()),
+            Some("zeroclaw"),
+            "X-Title must round-trip"
+        );
+        assert_eq!(
+            default_headers
+                .get("HTTP-Referer")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://example.com"),
+            "HTTP-Referer must round-trip"
+        );
+        assert_eq!(
+            default_headers
+                .get("X-Trace-Id")
+                .and_then(|v| v.to_str().ok()),
+            Some("trace-123"),
+            "X-Trace-Id must round-trip"
         );
     }
 
@@ -1932,7 +2086,8 @@ mod tests {
             1.0
         );
     }
-// ----------------------------------------------------------
+
+    // ----------------------------------------------------------
     // Responses-wire option propagation (#7690)
     //
     // Pinned regression: non-default options configured on
