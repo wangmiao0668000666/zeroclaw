@@ -159,7 +159,11 @@ export default function Logs() {
   // `(until_ts, until_id)` tie-break that can drop earlier-written
   // events when ids are written in non-lexicographic order. Fall back
   // to the legacy `[timestamp, id]` cursor when the daemon has not been
-  // upgraded to expose the byte-offset field.
+  // upgraded to expose the byte-offset field. The state is normalized
+  // to `number | null` on assignment (omitted vs explicit-null both
+  // deserialize to `null`) so `loadOlder`'s `!== null` check treats an
+  // old-daemon omitted field the same as an explicit-null field and
+  // routes through the legacy cursor branch instead of no-cursor.
   const [cursorOlderOffset, setCursorOlderOffset] = useState<number | null>(null);
   const [cursorOlderLegacy, setCursorOlderLegacy] = useState<[string, string] | null>(null);
   const [atEnd, setAtEnd] = useState(false);
@@ -214,7 +218,12 @@ export default function Logs() {
       // result entirely so we never overwrite the list with stale rows.
       if (seq !== loadSeqRef.current) return;
       setEvents(response.events);
-      setCursorOlderOffset(response.next_cursor_line_offset);
+      // Normalize omitted vs explicit-null: older daemons omit the
+      // field entirely (JSON.parse → `undefined`), newer daemons emit
+      // explicit `null`. `loadOlder`'s `!== null` check must treat both
+      // the same way — fall back to the legacy cursor — so a missing
+      // byte-offset field doesn't degrade pagination to "no cursor".
+      setCursorOlderOffset(response.next_cursor_line_offset ?? null);
       setCursorOlderLegacy(response.next_cursor);
       setAtEnd(response.at_end);
       setAttributionKeys(response.attribution_keys ?? []);
@@ -306,7 +315,8 @@ export default function Logs() {
         );
         return merged.slice(0, RING_CAPACITY);
       });
-      setCursorOlderOffset(response.next_cursor_line_offset);
+      // See `initialLoad` for the omitted-vs-null normalization rationale.
+      setCursorOlderOffset(response.next_cursor_line_offset ?? null);
       setCursorOlderLegacy(response.next_cursor);
       setAtEnd(response.at_end);
     } catch (err) {
