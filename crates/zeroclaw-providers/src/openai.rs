@@ -1743,6 +1743,45 @@ mod tests {
     //   list if/when a `with_seed` builder is introduced.
     // - `logprobs` — Responses API uses `top_logprobs` instead; not
     //   propagated. Same fallback path as `top_p`.
+    //
+    // Runtime options not yet wired into the responses provider
+    // (`OpenAiResponsesModelProvider` carries no fields for these;
+    // `build_responses_provider_if_requested` in factory.rs drops them
+    // on the floor rather than forwarding to the responses path).
+    // Listed here so the gap is visible from the test mod rather than
+    // only discoverable by reading the factory:
+    //
+    // - `provider_timeout_secs` — `OpenAiResponsesModelProvider` has no
+    //   `timeout_secs` field; non-streaming responses calls use
+    //   `Client::new()` with no client-builder timeout override, and
+    //   the streaming responses path likewise. `apply_compat_options`
+    //   forwards this to OpenAI-compatible providers only. Callers who
+    //   need a custom timeout on the responses path must extend
+    //   `OpenAiResponsesModelProvider` with a `timeout_secs` field,
+    //   mirror it through the non-streaming client builder, and add
+    //   the corresponding `with_timeout_secs` builder + wire-shape
+    //   test here.
+    // - `extra_headers` — `OpenAiResponsesModelProvider`'s
+    //   `build_request` only sets `Authorization` (plus `Accept` for
+    //   SSE); there is no header-merge step. `apply_compat_options`
+    //   forwards this to OpenAI-compatible providers only. Same
+    //   follow-up shape as `provider_timeout_secs`.
+    // - `api_path` — already routed correctly: the `api_url` argument
+    //   to `OpenAiResponsesModelProvider::new` lands in the
+    //   `responses_url` field, and the request-time URL is read from
+    //   there (covered by the `responses_url_appends_responses_to_custom_base`
+    //   test and the pre-existing propagation tests above). The
+    //   `opts.api_path` runtime option is therefore not separately
+    //   needed — the factory maps `api_url` (from the provider
+    //   config) into `OpenAiResponsesModelProvider::new`, which
+    //   composes the final URL with the `/responses` suffix.
+    //
+    // Issue #7690 acceptance criterion #1 explicitly listed timeout,
+    // headers, and API path as targets. This commit scopes down to
+    // option-propagation test pinning only; the timeout / headers
+    // implementation work is intentionally deferred to a follow-up
+    // PR that wires the missing fields through both the provider and
+    // the factory.
     // ----------------------------------------------------------
 
     #[test]
