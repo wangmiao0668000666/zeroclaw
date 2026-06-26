@@ -12,6 +12,8 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+#[cfg(feature = "a2a")]
+pub mod a2a;
 pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
@@ -732,6 +734,7 @@ pub async fn run_gateway(
             config.resolve_active_storage(),
             &config.data_dir,
             fallback.and_then(|e| e.api_key.as_deref()),
+            Some(&config.providers.models),
         ) {
             Ok(m) => Arc::from(m),
             Err(e) => {
@@ -866,6 +869,7 @@ pub async fn run_gateway(
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
                 &all_tools_result.ask_user_handle,
+                &all_tools_result.channel_room_handle,
                 &reaction_handle_gw_opt,
                 &all_tools_result.poll_handle,
                 &all_tools_result.escalate_handle,
@@ -1827,6 +1831,9 @@ pub async fn run_gateway(
             get(canvas::handle_canvas_history),
         );
 
+    #[cfg(feature = "a2a")]
+    let inner = inner.merge(a2a::a2a_routes());
+
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
     let inner = inner
@@ -1885,12 +1892,15 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
 
-    // Manual cron-trigger route lives on its own sub-router so it can opt out
-    // of the 30s gateway-wide TimeoutLayer. Layers attached here travel with
-    // the route through `merge`, so only this endpoint sees the longer
-    // timeout.
-    let cron_run_router: Router = Router::new()
-        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+    // Manual cron-trigger and A2A task routes live on their own sub-router so
+    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
+    // synchronous agent turn inline. Layers attached here travel with the
+    // route through `merge`, so only these endpoints see the longer timeout.
+    let long_running_router: Router<AppState> =
+        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    #[cfg(feature = "a2a")]
+    let long_running_router = long_running_router.merge(a2a::a2a_task_route());
+    let long_running_router: Router = long_running_router
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -1898,7 +1908,7 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(cron_run_router);
+    let inner = inner.merge(long_running_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -2376,7 +2386,7 @@ fn needs_quickstart_channel_reply() -> String {
 /// `agent_override` is the caller-requested agent alias (`/webhook?agent=`),
 /// already validated against `config.agents` by the handler. `None` keeps the
 /// legacy default pick (migration-synthesized "default", else first enabled).
-async fn run_gateway_chat_with_tools(
+pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
@@ -2697,7 +2707,7 @@ async fn handle_webhook(
             .await;
     }
 
-    let (provider_label, model_label) = {
+    let (provider_label, model_label, resolved_agent_alias) = {
         let cfg = state.config.read();
         let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
         let resolved_provider = resolved_agent_alias
@@ -2718,17 +2728,20 @@ async fn handle_webhook(
             })
             .or_else(|| cfg.resolve_default_model())
             .unwrap_or_else(|| "<unresolved>".to_string());
-        (provider_label, model_label)
+        (provider_label, model_label, resolved_agent_alias)
     };
     let started_at = Instant::now();
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let agent_alias = resolved_agent_alias.as_deref();
+    let channel_name = "gateway";
 
     state.observer.record_event(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             model_provider: provider_label.clone(),
             model: model_label.clone(),
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(channel_name.to_string()),
+            agent_alias: agent_alias.map(|s| s.to_string()),
+            turn_id: Some(turn_id.clone()),
         },
     );
     state.observer.record_event(
@@ -2736,9 +2749,9 @@ async fn handle_webhook(
             model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(channel_name.to_string()),
+            agent_alias: agent_alias.map(|s| s.to_string()),
+            turn_id: Some(turn_id.clone()),
         },
     );
 
@@ -2773,9 +2786,9 @@ async fn handle_webhook(
                     error_message: None,
                     input_tokens,
                     output_tokens,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
             state.observer.record_metric(
@@ -2788,9 +2801,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used,
                     cost_usd,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
 
@@ -2810,9 +2823,9 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 },
             );
             state.observer.record_metric(
@@ -2831,9 +2844,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(turn_id),
                 },
             );
 
