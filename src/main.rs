@@ -3663,19 +3663,44 @@ async fn main() -> Result<()> {
                         // under some feature combinations, so wrap the
                         // read in `lock()` to keep the `no-default-features`
                         // build (and 32-bit / Windows) green. The lock
-                        // is held for the duration of the REPL loop and
-                        // dropped at scope exit, restoring the original
-                        // behavior of stdin.
-                        let mut stdin = std::io::stdin().lock().take((STDIN_LINE_CAP + 1) as u64);
-                        let mut line = String::new();
+                        // is released at the end of each iteration so the
+                        // `Take` wrapper is **per-line** — unlike the
+                        // cumulative-Take bug on this branch's prior
+                        // commit — ensuring the cap resets each prompt.
                         loop {
                             eprint!("> ");
-                            line.clear();
-                            if stdin.read_line(&mut line)? == 0 {
+                            let mut buf = Vec::new();
+                            {
+                                let mut stdin =
+                                    std::io::stdin().lock().take((STDIN_LINE_CAP + 1) as u64);
+                                std::io::BufRead::read_until(&mut stdin, b'\n', &mut buf)?;
+                            }
+                            if buf.is_empty() {
                                 break;
                             }
-                            if line.len() > STDIN_LINE_CAP {
-                                line.truncate(STDIN_LINE_CAP);
+                            let truncated = buf.len() > STDIN_LINE_CAP;
+                            if truncated {
+                                buf.truncate(STDIN_LINE_CAP);
+                                // Drain remainder so the next read starts
+                                // at the next line.
+                                let mut discard = Vec::new();
+                                std::io::BufRead::read_until(
+                                    &mut std::io::stdin().lock().take(STDIN_LINE_CAP as u64),
+                                    b'\n',
+                                    &mut discard,
+                                )?;
+                                eprintln!(
+                                    "\nWarning: input line truncated to {} bytes (no newline within cap).",
+                                    STDIN_LINE_CAP
+                                );
+                                continue;
+                            }
+                            if buf.last() == Some(&b'\n') {
+                                buf.pop();
+                            }
+                            let line = String::from_utf8_lossy(&buf).into_owned();
+                            if line.trim().is_empty() {
+                                continue;
                             }
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)

@@ -191,6 +191,14 @@ pub(crate) fn read_capped_line<R: std::io::BufRead>(
     let truncated = raw.len() > cap;
     if truncated {
         raw.truncate(cap);
+        // Drain the remainder of this physical line from the
+        // underlying reader so the next `read_capped_line` call
+        // starts at the next line instead of continuing to read
+        // chunks from this one. Bounded to `cap` bytes to prevent
+        // unbounded reads from a pipe with no newline.
+        let inner = limited.into_inner();
+        let mut discard = Vec::new();
+        std::io::BufRead::read_until(&mut inner.take(cap as u64), b'\n', &mut discard)?;
     } else if raw.last() == Some(&b'\n') {
         // Strip the trailing `\n` that `read_until` leaves behind. The
         // lossy decode runs after the strip so the result has no
@@ -2230,15 +2238,18 @@ pub async fn run(
                     MAX_INTERACTIVE_INPUT_BYTES,
                 ) {
                     Ok((s, false)) if s.is_empty() => break,
-                    Ok((s, t)) => {
-                        if t {
-                            eprintln!(
-                                "\nWarning: input line truncated to {} bytes (no newline within cap).",
-                                MAX_INTERACTIVE_INPUT_BYTES
-                            );
-                        }
-                        (s, t)
+                    Ok((_s, true)) => {
+                        // Truncated line: warn once and skip. Sending a
+                        // chunked fragment into the agent loop would
+                        // appear as multiple prompts, causing repeated
+                        // model calls per oversized physical line.
+                        eprintln!(
+                            "\nWarning: input line truncated to {} bytes (no newline within cap).",
+                            MAX_INTERACTIVE_INPUT_BYTES
+                        );
+                        continue;
                     }
+                    Ok((s, _)) => (s, false),
                     Err(e) => {
                         eprintln!("\nError reading input: {e}\n");
                         break;
