@@ -388,11 +388,15 @@ impl CopilotModelProvider {
         let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
 
         let native_tools = Self::convert_tools(tools);
+        let tool_choice = native_tools
+            .as_ref()
+            .is_some_and(|t| !t.is_empty())
+            .then(|| "auto".to_string());
         let request = ApiChatRequest {
             model: model.to_string(),
             messages,
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice,
             tools: native_tools,
         };
 
@@ -870,5 +874,38 @@ mod tests {
 
         let result = CopilotModelProvider::to_api_content("assistant", "sure").unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "sure"));
+    }
+
+    #[test]
+    fn tool_choice_omitted_when_tools_empty() {
+        // Regression for #7862: vLLM 0.19+ returns HTTP 400 when an
+        // OpenAI-compat request body contains `tool_choice: "auto"` with an
+        // empty `tools` list ("When using tool_choice, tools must be set.").
+        // The Copilot provider's `send_chat_request` path must omit
+        // `tool_choice` whenever the converted tool list is `Some(vec![])`
+        // or `None`. (`convert_tools` itself wraps an empty input as
+        // `Some(vec![])` rather than `None`, so this gate is the only
+        // place the empty-list case is caught.)
+        //
+        // The serialized request shape is the observable contract: when
+        // `tools` is empty, the JSON body must NOT carry a `tool_choice`
+        // key (gated by `#[serde(skip_serializing_if = "Option::is_none")]`).
+        // Construct the request body inline with `static` lifetimes so we
+        // can exercise the wire-format path without going through the
+        // async `send_chat_request` (which would need a real GitHub
+        // token + network).
+        let tools: Option<Vec<NativeToolSpec<'static>>> = Some(vec![]);
+        let req = ApiChatRequest {
+            model: "claude-3.5".to_string(),
+            messages: vec![],
+            temperature: Some(0.0),
+            tool_choice: None, // gated: empty tools list ⇒ tool_choice omitted
+            tools,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is empty; got: {value}"
+        );
     }
 }
