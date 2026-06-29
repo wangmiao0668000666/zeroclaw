@@ -40,7 +40,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, ErrorKind, Read, Write};
 
 /// Per-line byte cap for stdin reads in interactive CLI modes (the simple_chat
 /// REPL fallback at line 3637 and the Windows-only "press Enter to exit"
@@ -416,9 +416,18 @@ fn pause_after_no_command_help() {
     // Cap the read so a piped-in flood (e.g. `dir | zeroclaw` with no
     // command) cannot blow up RSS in this trivial one-Enter prompt.
     // See module-level `STDIN_LINE_CAP` for rationale.
-    let mut stdin = std::io::stdin().take((STDIN_LINE_CAP + 1) as u64);
     let mut line = String::new();
-    let _ = std::io::BufRead::read_line(&mut stdin, &mut line);
+    // `Stdin::lock()` returns a `StdinLock<'_>` which is unconditionally
+    // `BufRead` across all target platforms and rustc feature gates; the
+    // unlocked `Stdin` is only `BufRead` on some platforms / under some
+    // feature combinations, so wrap the read in `lock()` to keep the
+    // `no-default-features` build (and 32-bit / Windows) green. The lock
+    // is dropped at the end of this scope, restoring the original
+    // behavior of stdin.
+    let _ = std::io::stdin()
+        .lock()
+        .take((STDIN_LINE_CAP + 1) as u64)
+        .read_line(&mut line);
     if line.len() > STDIN_LINE_CAP {
         line.truncate(STDIN_LINE_CAP);
     }
@@ -3647,12 +3656,24 @@ async fn main() -> Result<()> {
                         // covers in `loop_::read_capped_line`. See
                         // module-level `STDIN_LINE_CAP` for the cap
                         // rationale.
-                        let mut stdin = std::io::stdin().take((STDIN_LINE_CAP + 1) as u64);
+                        // `Stdin::lock()` returns a `StdinLock<'_>` which is
+                        // unconditionally `BufRead` across all target
+                        // platforms and rustc feature gates; the unlocked
+                        // `Stdin` is only `BufRead` on some platforms /
+                        // under some feature combinations, so wrap the
+                        // read in `lock()` to keep the `no-default-features`
+                        // build (and 32-bit / Windows) green. The lock
+                        // is held for the duration of the REPL loop and
+                        // dropped at scope exit, restoring the original
+                        // behavior of stdin.
+                        let mut stdin = std::io::stdin()
+                            .lock()
+                            .take((STDIN_LINE_CAP + 1) as u64);
                         let mut line = String::new();
                         loop {
                             eprint!("> ");
                             line.clear();
-                            if std::io::BufRead::read_line(&mut stdin, &mut line)? == 0 {
+                            if stdin.read_line(&mut line)? == 0 {
                                 break;
                             }
                             if line.len() > STDIN_LINE_CAP {
