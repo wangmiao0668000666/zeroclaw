@@ -81,13 +81,27 @@ enum WriterJob {
 /// `flush_for_test` to short-circuit on a dead worker rather than block.
 type WorkerDead = Arc<AtomicBool>;
 
-struct WriterState {
+/// Per-worker state (no `tx` — the worker is the consumer, not a producer).
+/// The `policy` and `worker_dead` fields are shared with the producer-facing
+/// [`WriterState`].
+struct WorkerState {
     policy: ResolvedPolicy,
     /// Reserved for future serialized-rotation paths. The worker thread
     /// is the sole owner of the file handle for the active path today,
     /// so this lock is currently unheld; kept on the struct so a future
     /// refactor that needs to pause the worker for atomic file swaps
     /// has a place to acquire it.
+    #[allow(dead_code)]
+    write_lock: Mutex<()>,
+    worker_dead: WorkerDead,
+}
+
+/// Producer-facing state. The `tx` sender is NOT shared with the worker
+/// so the channel's [`Disconnected`](std::sync::mpsc::TrySendError::Disconnected)
+/// exit path can fire once the last producer drops their sender.
+struct WriterState {
+    policy: ResolvedPolicy,
+    /// Reserved for future serialized-rotation paths.
     #[allow(dead_code)]
     write_lock: Mutex<()>,
     tx: SyncSender<WriterJob>,
@@ -127,13 +141,12 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
     let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
 
     if policy.storage.is_enabled() {
-        let state_for_worker = Arc::new(WriterState {
+        let worker_state = Arc::new(WorkerState {
             policy: policy.clone(),
             write_lock: Mutex::new(()),
-            tx: tx.clone(),
             worker_dead: Arc::clone(&worker_dead),
         });
-        spawn_worker(rx, Arc::clone(&state_for_worker));
+        spawn_worker(rx, worker_state);
     }
 
     let state = Arc::new(WriterState {
@@ -149,7 +162,7 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
 /// log file handle and processes `WriterJob`s until either the channel
 /// closes (all senders dropped) or the process exits. On normal exit the
 /// worker performs a final `sync_all` so any pending writes are durable.
-fn spawn_worker(rx: Receiver<WriterJob>, state: Arc<WriterState>) {
+fn spawn_worker(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
     let dead = Arc::clone(&state.worker_dead);
     let builder = thread::Builder::new().name("zeroclaw-log-writer".into());
     if let Err(err) = builder.spawn(move || worker_main(rx, state)) {
@@ -169,21 +182,23 @@ fn spawn_worker(rx: Receiver<WriterJob>, state: Arc<WriterState>) {
 /// real perf win is dropping the per-record `sync_data` and replacing
 /// it with periodic `sync_all` based on either write count or
 /// wall-clock time, whichever fires first.
-fn worker_main(rx: Receiver<WriterJob>, state: Arc<WriterState>) {
+fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
     let mut writes_since_sync: u64 = 0;
     let mut last_sync = Instant::now();
 
     loop {
-        // Block on the channel with a short timeout so the periodic sync
-        // interval is honoured even when the queue is empty, and so a
-        // graceful shutdown is not blocked on an idle worker.
+        // Block on the channel with a short timeout so a graceful shutdown
+        // (channel close from dropped senders) is not blocked on an idle
+        // worker. The timeout is NOT used for periodic sync or date-rotation
+        // polling — those are driven by write activity in `write_one` and by
+        // the gated sync check below.
         let job = match rx.recv_timeout(IDLE_TICK) {
             Ok(job) => Some(job),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
-        let idle_tick = if let Some(job) = job {
+        if let Some(job) = job {
             match job {
                 WriterJob::Write(value) => {
                     if let Err(err) = write_one(&state, &value) {
@@ -210,29 +225,17 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WriterState>) {
                     let _ = ack.send(());
                 }
             }
-            false
-        } else {
-            true
-        };
-
-        // Idle tick: still honour date-boundary rotation so the first
-        // event of a new day lands in a fresh file even if no writes
-        // have arrived yet.
-        if idle_tick
-            && state.policy.storage == StoragePolicy::Rotating
-            && let Err(err) = maybe_rotate_for_date(&state)
-        {
-            tracing::warn!(
-                target: "zeroclaw_log_internal",
-                error = ?err,
-                "log: worker date-rotation failed"
-            );
         }
 
-        // Periodic sync. Whichever of write-count or wall-clock cadence
-        // fires first wins; this bounds both burst-driven latency and
-        // trickle-driven data-loss window.
-        if writes_since_sync >= SYNC_EVERY_N_WRITES || last_sync.elapsed() >= SYNC_INTERVAL {
+        // Periodic sync. Only actually syncs when there are unsynced writes.
+        // Write-count and wall-clock cadences are combined: whichever fires
+        // first wins. When the worker has no unsynced writes (e.g. after a
+        // Flush rendezvous or a quiet period), no disk activity occurs —
+        // the sync_all inside `write_one` before every actual write already
+        // covers the burst-driven case.
+        if writes_since_sync > 0
+            && (writes_since_sync >= SYNC_EVERY_N_WRITES || last_sync.elapsed() >= SYNC_INTERVAL)
+        {
             if let Err(err) = sync_active_file(&state) {
                 tracing::warn!(
                     target: "zeroclaw_log_internal",
@@ -256,7 +259,7 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WriterState>) {
 /// rotation hooks inline (so they can rename the file out from under
 /// the next write), and drops the handle on return. No `sync_data` —
 /// durability is the worker's periodic `sync_all`.
-fn write_one(state: &Arc<WriterState>, value: &Value) -> Result<()> {
+fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
     // Date-boundary rotation runs *before* the append so a new day's
     // first event lands in a fresh file. Idempotent when no rotation
     // is needed.
@@ -280,7 +283,7 @@ fn write_one(state: &Arc<WriterState>, value: &Value) -> Result<()> {
 /// Open the active file just long enough to call `sync_all`. Used for
 /// Flush and the periodic sync cadence. Returns Ok(()) when the file
 /// does not exist yet (no writes have happened this run).
-fn sync_active_file(state: &Arc<WriterState>) -> Result<()> {
+fn sync_active_file(state: &Arc<WorkerState>) -> Result<()> {
     let file = match open_active_file(state) {
         Ok(f) => f,
         Err(_) => return Ok(()),
@@ -293,7 +296,7 @@ fn sync_active_file(state: &Arc<WriterState>) -> Result<()> {
 /// 0o600 Unix permission bit. Called once at worker startup and again
 /// after any operation that may have renamed the file out from under
 /// us (rotation, rolling trim).
-fn open_active_file(state: &Arc<WriterState>) -> Result<File> {
+fn open_active_file(state: &Arc<WorkerState>) -> Result<File> {
     if let Some(parent) = state.policy.path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating log directory {}", parent.display()))?;
@@ -444,7 +447,7 @@ fn write_jsonl_line<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<
 /// Rolling trim. Streams the file line-by-line into a temp file, keeping
 /// the last `max_entries` lines, then atomically renames. Never loads the
 /// whole file into memory.
-fn trim_to_last_entries(state: &Arc<WriterState>) -> Result<()> {
+fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
     // Count lines first (cheap pass).
     let total = count_nonempty_lines(&state.policy.path)?;
     if total <= state.policy.max_entries {
@@ -534,7 +537,7 @@ fn count_nonempty_lines(path: &Path) -> Result<usize> {
 /// Rotate the active file to an archive when it has crossed a UTC day boundary
 /// since its last write. No-op when daily rotation is off, the file is absent,
 /// or it was last written today.
-fn maybe_rotate_for_date(state: &Arc<WriterState>) -> Result<()> {
+fn maybe_rotate_for_date(state: &Arc<WorkerState>) -> Result<()> {
     if !state.policy.rotate_daily {
         return Ok(());
     }
@@ -561,7 +564,7 @@ fn maybe_rotate_for_date(state: &Arc<WriterState>) -> Result<()> {
 /// Rotate the active file when a just-completed append left it at or above the
 /// configured byte budget. No-op when size rotation is disabled (`max_bytes`
 /// `== 0`) or the file is under budget.
-fn maybe_rotate_for_size(state: &Arc<WriterState>) -> Result<()> {
+fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<()> {
     let max = state.policy.max_bytes;
     if max == 0 {
         return Ok(());
@@ -589,7 +592,7 @@ fn maybe_rotate_for_size(state: &Arc<WriterState>) -> Result<()> {
 /// archives. Archive names keep the active file's extension so an operator's
 /// `*.jsonl` tooling still matches them, e.g.
 /// `runtime-trace.jsonl` → `runtime-trace.20260624-031500.jsonl`.
-fn rotate_active(state: &Arc<WriterState>, when: DateTime<Utc>) -> Result<()> {
+fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
     let path = &state.policy.path;
     let archive = archive_path(path, when)?;
     fs::rename(path, &archive)
@@ -601,7 +604,7 @@ fn rotate_active(state: &Arc<WriterState>, when: DateTime<Utc>) -> Result<()> {
         let _ = fs::set_permissions(&archive, fs::Permissions::from_mode(0o600));
     }
 
-    run_retention(state);
+    run_retention(&state.policy);
     Ok(())
 }
 
@@ -725,14 +728,14 @@ fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
 /// Prune rotated archives by age then by count. Best-effort: a removal failure
 /// is logged but never fails the enclosing append, since retention is
 /// housekeeping rather than part of the durability contract.
-fn run_retention(state: &Arc<WriterState>) {
-    let max_files = state.policy.retention_max_files;
-    let max_age_days = state.policy.retention_max_age_days;
+fn run_retention(policy: &ResolvedPolicy) {
+    let max_files = policy.retention_max_files;
+    let max_age_days = policy.retention_max_age_days;
     if max_files == 0 && max_age_days == 0 {
         return;
     }
 
-    let mut archives = match list_archives(&state.policy.path) {
+    let mut archives = match list_archives(&policy.path) {
         Ok(a) => a,
         Err(err) => {
             tracing::warn!(
@@ -1012,7 +1015,7 @@ mod tests {
             archives.push(p);
         }
 
-        run_retention(&current_state().unwrap());
+        run_retention(&current_state().unwrap().policy);
 
         assert!(
             !archives[0].exists() && !archives[1].exists(),
@@ -1040,7 +1043,7 @@ mod tests {
         set_mtime(&old, SystemTime::now() - Duration::from_secs(3 * 86_400));
         set_mtime(&recent, SystemTime::now() - Duration::from_secs(3_600));
 
-        run_retention(&current_state().unwrap());
+        run_retention(&current_state().unwrap().policy);
 
         assert!(!old.exists(), "archive older than the age cap is pruned");
         assert!(recent.exists(), "recent archive is kept");
