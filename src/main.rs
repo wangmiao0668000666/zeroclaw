@@ -41,6 +41,17 @@ use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{ErrorKind, Read, Write};
+
+/// Per-line byte cap for stdin reads in interactive CLI modes (the simple_chat
+/// REPL fallback at line 3637 and the Windows-only "press Enter to exit"
+/// prompt at line 401). Matches `zeroclaw_runtime::agent::loop_::
+/// MAX_INTERACTIVE_INPUT_BYTES` (1 MiB) by convention. The cap is duplicated
+/// here — at module level rather than re-declared in each call site — so the
+/// value is visible in one place for both call sites and can be adjusted in
+/// a single edit. Defense against a piped-in flood
+/// (e.g. `head -c 10G /dev/zero | zeroclaw chat`) that would otherwise grow
+/// the per-line `String` until the process OOMs.
+const STDIN_LINE_CAP: usize = 1024 * 1024;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
@@ -404,16 +415,12 @@ fn pause_after_no_command_help() {
     let _ = std::io::stdout().flush();
     // Cap the read so a piped-in flood (e.g. `dir | zeroclaw` with no
     // command) cannot blow up RSS in this trivial one-Enter prompt.
-    // Matches `zeroclaw_runtime::agent::loop_::MAX_INTERACTIVE_INPUT_BYTES`
-    // (1 MiB) by convention; the cap is duplicated here because this
-    // Windows-only path runs regardless of whether the `agent-runtime`
-    // feature is on.
-    const CAP: usize = 1024 * 1024;
-    let mut stdin = std::io::stdin().take((CAP + 1) as u64);
+    // See module-level `STDIN_LINE_CAP` for rationale.
+    let mut stdin = std::io::stdin().take((STDIN_LINE_CAP + 1) as u64);
     let mut line = String::new();
     let _ = std::io::BufRead::read_line(&mut stdin, &mut line);
-    if line.len() > CAP {
-        line.truncate(CAP);
+    if line.len() > STDIN_LINE_CAP {
+        line.truncate(STDIN_LINE_CAP);
     }
 }
 
@@ -3633,14 +3640,23 @@ async fn main() -> Result<()> {
                         println!("{response}");
                     }
                     None => {
-                        // Interactive mode
-                        let stdin = std::io::stdin();
+                        // Interactive mode. Cap the per-line read so a
+                        // piped-in flood (e.g. `head -c 10G /dev/zero |
+                        // zeroclaw chat`) cannot OOM the process — same
+                        // audit-flagged vector the agent-runtime path
+                        // covers in `loop_::read_capped_line`. See
+                        // module-level `STDIN_LINE_CAP` for the cap
+                        // rationale.
+                        let mut stdin = std::io::stdin().take((STDIN_LINE_CAP + 1) as u64);
                         let mut line = String::new();
                         loop {
                             eprint!("> ");
                             line.clear();
-                            if stdin.read_line(&mut line)? == 0 {
+                            if std::io::BufRead::read_line(&mut stdin, &mut line)? == 0 {
                                 break;
+                            }
+                            if line.len() > STDIN_LINE_CAP {
+                                line.truncate(STDIN_LINE_CAP);
                             }
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
