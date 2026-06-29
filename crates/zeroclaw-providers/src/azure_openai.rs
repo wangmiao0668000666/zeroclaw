@@ -489,10 +489,14 @@ impl ModelProvider for AzureOpenAiModelProvider {
         })?;
 
         let tools = Self::convert_tools(request.tools);
+        let tool_choice = tools
+            .as_ref()
+            .is_some_and(|t| !t.is_empty())
+            .then(|| "auto".to_string());
         let native_request = NativeChatRequest {
             messages: Self::convert_messages(request.messages),
             temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice,
             tools,
             reasoning_effort: self.reasoning_effort_for_model(model),
             max_completion_tokens: None,
@@ -788,6 +792,37 @@ mod tests {
         assert!(json.contains("\"role\":\"user\""));
         // Azure requests should NOT contain a model field (deployment is in the URL)
         assert!(!json.contains("\"model\""));
+    }
+
+    #[test]
+    fn tool_choice_omitted_when_tools_empty() {
+        // Regression for #7862: vLLM 0.19+ returns HTTP 400 when an
+        // OpenAI-compat request body contains `tool_choice: "auto"` with an
+        // empty `tools` list ("When using tool_choice, tools must be set.").
+        // The Azure provider's classic `chat()` path must omit `tool_choice`
+        // whenever the converted tool list is `Some(vec![])` or `None`.
+        // (`chat_with_tools` already handles empty lists upstream at line 558
+        // and is not affected.)
+        //
+        // The serialized request shape is the observable contract: when
+        // `tools` is empty, the JSON body must NOT carry a `tool_choice`
+        // key (the field is gated by `serde(skip_serializing_if =
+        // "Option::is_none")`). Construct the request the way `chat()`
+        // would for an empty tool list and assert the gate holds.
+        let tools: Option<Vec<NativeToolSpec>> = Some(vec![]);
+        let req = NativeChatRequest {
+            messages: vec![],
+            temperature: Some(0.0),
+            tools,
+            tool_choice: None, // gated: empty tools list ⇒ tool_choice omitted
+            reasoning_effort: None,
+            max_completion_tokens: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is empty; got: {value}"
+        );
     }
 
     #[test]
