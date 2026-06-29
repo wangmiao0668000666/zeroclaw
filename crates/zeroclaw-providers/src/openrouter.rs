@@ -724,11 +724,15 @@ impl ModelProvider for OpenRouterModelProvider {
         })?;
 
         let tools = Self::convert_tools(request.tools);
+        let tool_choice = tools
+            .as_ref()
+            .is_some_and(|t| !t.is_empty())
+            .then(|| "auto".to_string());
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice,
             tools,
             max_tokens: self.max_tokens,
             stream: None,
@@ -819,11 +823,15 @@ impl ModelProvider for OpenRouterModelProvider {
         };
 
         let tools = Self::convert_tools(request.tools);
+        let tool_choice = tools
+            .as_ref()
+            .is_some_and(|t| !t.is_empty())
+            .then(|| "auto".to_string());
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice,
             tools,
             max_tokens: self.max_tokens,
             stream: Some(true),
@@ -954,7 +962,10 @@ impl ModelProvider for OpenRouterModelProvider {
             model: model.to_string(),
             messages: native_messages,
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: native_tools
+                .as_ref()
+                .is_some_and(|t| !t.is_empty())
+                .then(|| "auto".to_string()),
             tools: native_tools,
             max_tokens: self.max_tokens,
             stream: None,
@@ -1146,6 +1157,34 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn tool_choice_omitted_when_tools_empty() {
+        // Regression for #7862: vLLM 0.19+ returns HTTP 400 when an
+        // OpenAI-compat request body contains `tool_choice: "auto"` with an
+        // empty `tools` list ("When using tool_choice, tools must be set.").
+        // The OpenRouter provider's `chat()`, `stream_chat()`, and
+        // `chat_with_tools()` paths must omit `tool_choice` whenever the
+        // converted tool list is `Some(vec![])` or `None`.
+        // (`chat_with_tools` already coerces an empty input list to
+        // `native_tools = None` upstream at line 922, but the wire-format
+        // gate at the request-build site is the load-bearing invariant.)
+        let tools: Option<Vec<NativeToolSpec>> = Some(vec![]);
+        let req = NativeChatRequest {
+            model: "anthropic/claude-haiku-4-5".into(),
+            messages: vec![],
+            temperature: Some(0.0),
+            tools,
+            tool_choice: None, // gated: empty tools list ⇒ tool_choice omitted
+            max_tokens: None,
+            stream: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is empty; got: {value}"
+        );
     }
 
     #[test]
