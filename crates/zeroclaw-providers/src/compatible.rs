@@ -1951,7 +1951,7 @@ impl OpenAiCompatibleModelProvider {
         allow_user_image_parts: bool,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
-        let tool_choice = tools.as_ref().map(|_| "auto".to_string());
+        let tool_choice = has_tool_entries.then(|| "auto".to_string());
 
         NativeChatRequest {
             model: model.to_string(),
@@ -3017,7 +3017,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         include_usage: true,
                     }),
                     tools: tools.clone(),
-                    tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                    tool_choice: has_tools.then(|| "auto".to_string()),
                     max_tokens: provider.max_tokens,
                     extra_body: provider.extra_body.clone(),
                 })
@@ -3539,6 +3539,42 @@ mod tests {
             Some(true),
             "tool-enabled streaming request must serialize stream_options.include_usage=true; \
              without it OpenAI-compatible providers omit the final usage event"
+        );
+    }
+
+    #[test]
+    fn tool_choice_omitted_when_tools_empty() {
+        // Regression for #7862: vLLM 0.19+ returns HTTP 400 when an
+        // OpenAI-compat request body contains `tool_choice: "auto"` with an
+        // empty `tools` list ("When using tool_choice, tools must be set.").
+        // `build_native_tool_chat_request` must omit `tool_choice` whenever
+        // the converted tool list is `Some(vec![])` or `None`.
+        let provider = make_model_provider("vllm-test", "https://example.com", None);
+        let req = provider.build_native_tool_chat_request(
+            &[],
+            Some(vec![]),
+            "llama-3.3-70b",
+            Some(0.0),
+            false,
+        );
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is empty; got: {value}"
+        );
+        // Sanity: a non-empty tool list still produces tool_choice.
+        let req_with_tools = provider.build_native_tool_chat_request(
+            &[],
+            Some(vec![serde_json::json!({"name": "echo"})]),
+            "llama-3.3-70b",
+            Some(0.0),
+            false,
+        );
+        let value_with_tools: serde_json::Value = serde_json::to_value(&req_with_tools).unwrap();
+        assert_eq!(
+            value_with_tools.get("tool_choice").and_then(|v| v.as_str()),
+            Some("auto"),
+            "tool_choice must remain \"auto\" when tools is non-empty"
         );
     }
 
