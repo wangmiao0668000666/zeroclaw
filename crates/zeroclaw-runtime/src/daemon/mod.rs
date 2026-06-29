@@ -764,27 +764,45 @@ pub async fn run(
 
     // Fire channel cancellation before aborting supervisors so listener tasks
     // get a chance to drop their `Arc<dyn Channel>` (and the matrix-sdk SQLite
-    // pools the Arc transitively pins). Give cooperative components (e.g.
-    // the cron scheduler, which returns `Ok(())` on its cancellation arm)
-    // a bounded grace period to finish their own Ok(()) exit before we
-    // force-abort; without this, the supervisor's "exited unexpectedly"
-    // log path would misclassify every clean shutdown. Hard cap of
-    // [`COMPONENT_SHUTDOWN_GRACE_SECS`] seconds; we fall back to
-    // `handle.abort()` for any component that does not finish in time.
-    // Fire channel cancellation before aborting supervisors so listener tasks
-    // get a chance to drop their `Arc<dyn Channel>` (and the matrix-sdk SQLite
     // pools the Arc transitively pins). The supervisor itself observes the
     // same `cancel` token (see `spawn_component_supervisor`); cooperative
     // components like the cron scheduler (#8465) return `Ok(())` cleanly on
     // their cancellation arm and the supervisor exits the restart loop.
-    // Components that ignore cancel are then force-aborted below; the
-    // subsequent `JoinHandle::await` is bounded by the runtime tearing
-    // down the aborted task at its next yield point.
+    // Components that abort their async work before a forced abort will
+    // still get `handle.abort()` called, but the tokio abort on an already-
+    // completed task is a no-op, so the `handle.await` below resolves
+    // immediately rather than waiting for a yield point.
     channels_cancel.cancel();
-    for handle in &handles {
-        handle.abort();
+
+    // Grace window: cooperative components (e.g. the cron scheduler)
+    // get a bounded window to observe the cancellation token and exit
+    // cleanly before forced abort. Without this the abort wins the race
+    // against the supervisor's `cancel.is_cancelled()` check. The
+    // `select!` uses biased priority so an already-finished handle is
+    // drained immediately even before the deadline fires.
+    // Handles that complete during the grace window are dropped; only
+    // handles that must be force-aborted go into `remaining` for
+    // a final bounded await.
+    const GRACE_WINDOW: Duration = Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + GRACE_WINDOW;
+    let mut remaining: Vec<JoinHandle<()>> = Vec::new();
+    for mut handle in handles {
+        tokio::select! {
+            biased;
+            _ = &mut handle => {
+                // Cooperative handle exited cleanly during grace window.
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                // Grace window expired; force-abort and re-join later.
+                handle.abort();
+                remaining.push(handle);
+            }
+        }
     }
-    for handle in handles {
+    // Await remaining (aborted) handles. Already-completed handles from
+    // the grace window are not re-await, so "JoinHandle polled after
+    // completion" is avoided.
+    for handle in remaining {
         let _ = handle.await;
     }
 
