@@ -2505,6 +2505,103 @@ mod tests {
         assert!(has_tui_registry);
     }
 
+    /// Daemon-boundary evidence for #8465: the cooperative scheduler
+    /// shutdown must be observable through the real `daemon::run`
+    /// shutdown loop, not only the `spawn_component_supervisor` helper
+    /// in isolation (see `supervisor_marks_clean_shutdown_when_cancel_fires`).
+    ///
+    /// The earlier two-patch series proved that the supervisor's
+    /// `cancel.is_cancelled()` branch classifies a cooperative `Ok(())`
+    /// as clean, and that the daemon's bounded 500ms grace window lets
+    /// the scheduler's `cancel.cancelled()` arm fire before the abort
+    /// fallback. This test proves the *combined* path through the real
+    /// `daemon::run` reload flow rather than a hand-rolled supervisor
+    /// call: the scheduler is enabled in config, spawned by the daemon,
+    /// observes the same `channels_cancel` token, takes its cancel arm,
+    /// returns `Ok(())`, and the supervisor takes the clean-shutdown
+    /// return path.
+    ///
+    /// The reviewer asked specifically for evidence that the supervisor's
+    /// `cancel.is_cancelled()` branch runs through the real daemon
+    /// shutdown loop. The supervisor's observable state lives in the
+    /// `crate::health::snapshot_json()` output:
+    ///   - `restart_count == 0` proves the supervisor took the
+    ///     clean-shutdown `return` path, because every other supervisor
+    ///     branch (unexpected `Ok(())` after a normal exit, or `Err`)
+    ///     calls `bump_component_restart`. Only the cancel-aware
+    ///     `return` skips the bump.
+    ///   - `status == "ok"` (and `last_error == null`) confirms the
+    ///     scheduler's cancel arm ran, since that arm calls
+    ///     `crate::health::mark_component_ok(SCHEDULER_COMPONENT)`
+    ///     before returning `Ok(())`. The supervisor's `mark_component_ok`
+    ///     is also called in the clean path.
+    ///
+    /// The scheduler is the only component whose `Ok(())` return is
+    /// gated on its cancellation arm, so observing
+    /// `restart_count == 0` here means the cooperative cancel arm was
+    /// actually exercised through the real `daemon::run` shutdown path.
+    #[tokio::test]
+    async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.scheduler.enabled = true;
+        // First `tokio::time::interval` tick fires immediately; the
+        // scheduler then parks at `select! { interval.tick(), cancel.cancelled() }`
+        // waiting for the next tick (5s, the MIN_POLL_SECONDS floor).
+        // We trigger reload well within that window so the cancel arm
+        // wins deterministically.
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg| {
+                Box::pin(async move {
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    // Give the scheduler a tick to enter its select!
+                    // loop and park at the next interval tick or cancel.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    reload_tx.send(true).expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let exit = timeout(
+            Duration::from_secs(3),
+            run(config, "127.0.0.1".to_string(), 0, registry, false),
+        )
+        .await
+        .expect("daemon should return after gateway-triggered reload")
+        .expect("daemon run should succeed");
+        assert_eq!(exit, DaemonExit::Reload);
+
+        // The scheduler's cooperative cancel arm must have fired
+        // through the real `daemon::run` shutdown loop. See this
+        // function's doc comment for why `restart_count == 0` is the
+        // load-bearing assertion: every supervisor branch except the
+        // cancel-aware `return` calls `bump_component_restart`.
+        let snapshot = crate::health::snapshot_json();
+        let component = &snapshot["components"]["scheduler"];
+        assert_eq!(
+            component["status"], "ok",
+            "scheduler health snapshot must show ok after cooperative shutdown; got: {component}"
+        );
+        assert_eq!(
+            component["restart_count"].as_u64().unwrap_or(0),
+            0,
+            "scheduler must not have been restarted; \
+             restart_count > 0 means the supervisor took the unexpected-Ok or Err branch \
+             instead of the cancel-aware return, which is the regression this test pins"
+        );
+        assert!(
+            component["last_error"].is_null(),
+            "scheduler must have no last_error after cooperative shutdown; got: {component}"
+        );
+    }
+
     #[tokio::test]
     async fn ephemeral_does_not_exit_before_client_connects() {
         use tokio::time::{Duration, timeout};
