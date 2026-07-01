@@ -5,7 +5,7 @@ use directories::UserDirs;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -47,6 +47,23 @@ const CLAWHUB_DOMAIN: &str = "clawhub.ai";
 const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
 const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
+/// Maximum number of entries in a single skill archive. Caps the path-explosion
+/// surface even when individual entries are tiny.
+const MAX_CLAWHUB_ZIP_ENTRIES: usize = 500;
+/// Maximum total decompressed bytes across all entries. Independent of
+/// [`MAX_CLAWHUB_ZIP_BYTES`] (which is the compressed cap) so a zip bomb that
+/// deflates a few MiB to many GiB is rejected on extraction, not on download.
+const MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
+/// Maximum per-archive uncompressed/compressed ratio. A single entry that
+/// deflate-compresses 100x is the canonical zip bomb shape; the global cap
+/// on uncompressed bytes would also catch it, but the ratio guard rejects
+/// the archive before any write happens.
+const MAX_CLAWHUB_ZIP_RATIO: u64 = 10;
+/// Per-entry uncompressed byte cap. Mirrors
+/// [`MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES`] so a single lying entry cannot
+/// bypass the cumulative cap by claiming a small declared size in the
+/// central directory and writing more on `read`.
+const MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -2195,11 +2212,28 @@ fn is_unsafe_zip_entry_name(raw_name: &str) -> bool {
         || raw_name.contains(':')
 }
 
+/// Remove the partially-populated `dest` directory and swallow any
+/// secondary error from the cleanup itself. The caller has already decided
+/// the extraction has failed; the cleanup is best-effort.
+fn cleanup_failed_extract_dest(dest: &Path) {
+    let _ = std::fs::remove_dir_all(dest);
+}
+
 /// Securely extract a downloaded skill zip into `dest`.
 ///
 /// Rejects archives larger than `max_bytes` and any entry whose path could
-/// escape `dest`. On a rejected entry the partially-created `dest` is removed
-/// before returning. Shared by the ClawHub installer and unit-tested directly.
+/// escape `dest`. Defends against zip bombs (refs #8554) with four
+/// decompression-side guards in addition to the compressed-size cap:
+///
+/// - entry count cap ([`MAX_CLAWHUB_ZIP_ENTRIES`])
+/// - cumulative uncompressed-size cap ([`MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES`])
+/// - per-archive compression-ratio cap ([`MAX_CLAWHUB_ZIP_RATIO`])
+/// - per-entry read cap ([`MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES`]) so a single
+///   entry that lies about its declared size in the central directory
+///   cannot blow the cumulative cap mid-write
+///
+/// On any rejection the partially-created `dest` is removed before
+/// returning. Shared by the ClawHub installer and unit-tested directly.
 fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()> {
     if bytes.len() as u64 > max_bytes {
         anyhow::bail!(
@@ -2214,14 +2248,75 @@ fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()>
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
 
-    for i in 0..archive.len() {
+    // Guard 0: entry count cap. The cap is cheap to evaluate upfront and
+    // bounds the loop below; checking inside the loop would still work but
+    // would also iterate the central directory header for a clearly-bad
+    // archive.
+    let entry_count = archive.len();
+    if entry_count > MAX_CLAWHUB_ZIP_ENTRIES {
+        cleanup_failed_extract_dest(dest);
+        anyhow::bail!(
+            "skill zip rejected: too many entries ({entry_count} > {MAX_CLAWHUB_ZIP_ENTRIES})"
+        );
+    }
+
+    // Track cumulative uncompressed bytes and per-archive compression ratio
+    // across the whole extraction so a single mid-stream `read` past the
+    // cap is caught at the next entry boundary, not after partial writes
+    // have already landed on disk.
+    let mut cumulative_uncompressed: u64 = 0;
+    let mut cumulative_compressed: u64 = 0;
+
+    for i in 0..entry_count {
         let mut entry = archive.by_index(i)?;
         let raw_name = entry.name().to_string();
 
         if is_unsafe_zip_entry_name(&raw_name) {
-            let _ = std::fs::remove_dir_all(dest);
+            cleanup_failed_extract_dest(dest);
             anyhow::bail!("zip entry contains unsafe path: {raw_name}");
         }
+
+        let declared_size = entry.size();
+        let declared_compressed = entry.compressed_size();
+
+        // Cumulative uncompressed cap. Checked before any write so a bomb
+        // that inflates past 50 MiB never touches disk.
+        let new_cumulative = cumulative_uncompressed.saturating_add(declared_size);
+        if new_cumulative > MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES {
+            cleanup_failed_extract_dest(dest);
+            anyhow::bail!(
+                "skill zip rejected: decompressed total {} bytes > {}",
+                new_cumulative,
+                MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES
+            );
+        }
+
+        // Per-archive compression-ratio cap. A single-entry bomb deflated
+        // 100x is the canonical attack shape; the cumulative cap would also
+        // catch it (the 50 MiB uncompressed cap is tight), but the ratio
+        // guard rejects the archive before any single byte is written when
+        // the ratio is egregious. Ratio is computed on declared sizes
+        // (central directory), so this is also a static check.
+        //
+        // A `compressed_size` of 0 is allowed by the `zip` crate for
+        // streaming-only entries; skip the ratio check in that case to
+        // avoid division by zero / divide-by-tiny noise.
+        if declared_compressed > 0 {
+            // Round up to keep the bound tight. A 50 MiB declared / 5 MiB
+            // compressed archive has ratio 10; we want to reject ratio > 10
+            // (i.e. >= 11x).
+            let ratio = declared_size.div_ceil(declared_compressed);
+            if ratio > MAX_CLAWHUB_ZIP_RATIO {
+                cleanup_failed_extract_dest(dest);
+                anyhow::bail!(
+                    "skill zip rejected: compression ratio {ratio}x > {}x for entry {raw_name:?}",
+                    MAX_CLAWHUB_ZIP_RATIO
+                );
+            }
+        }
+
+        cumulative_uncompressed = new_cumulative;
+        cumulative_compressed = cumulative_compressed.saturating_add(declared_compressed);
 
         let out_path = dest.join(&raw_name);
         if entry.is_dir() {
@@ -2239,7 +2334,42 @@ fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()>
                 out_path.display().to_string()
             )
         })?;
-        std::io::copy(&mut entry, &mut out_file)?;
+
+        // Guard 3: per-entry read cap. Wrap the entry reader with `take`
+        // so a central-directory size declaration that understates the real
+        // payload cannot blow the cumulative cap. The take bound is
+        // generous (matches the cumulative cap) so honest archives are
+        // unaffected; the cap is enforced via `io::copy` returning fewer
+        // bytes than `take` allowed and a follow-up read of zero bytes.
+        let mut bounded = (&mut entry).take(MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES);
+        let copied = std::io::copy(&mut bounded, &mut out_file).with_context(|| {
+            format!(
+                "failed to write extracted file: {}",
+                out_path.display().to_string()
+            )
+        })?;
+        if copied > MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES {
+            cleanup_failed_extract_dest(dest);
+            anyhow::bail!(
+                "skill zip rejected: entry {raw_name:?} exceeded per-entry byte cap of {}",
+                MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES
+            );
+        }
+    }
+
+    // Final ratio cross-check on the whole archive, not just per-entry.
+    // Catches a low-ratio prelude that pulls the per-archive average past
+    // the bound once late entries inflate further. (Belt and suspenders;
+    // each individual entry already passed the per-entry ratio cap above.)
+    if cumulative_compressed > 0 {
+        let overall_ratio = cumulative_uncompressed.div_ceil(cumulative_compressed);
+        if overall_ratio > MAX_CLAWHUB_ZIP_RATIO {
+            cleanup_failed_extract_dest(dest);
+            anyhow::bail!(
+                "skill zip rejected: overall compression ratio {overall_ratio}x > {}x",
+                MAX_CLAWHUB_ZIP_RATIO
+            );
+        }
     }
 
     Ok(())
@@ -2878,6 +3008,102 @@ mod registry_tests {
         assert!(
             !dest.exists(),
             "dest must not be created when the zip is rejected for size"
+        );
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_inflation_oversize() {
+        // Zip bomb: 60 MiB of repeated payload with Stored compression (ratio
+        // 1x, so ratio guard does not fire) but uncompressed total exceeds
+        // MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES (50 MiB). We pass a larger
+        // `max_bytes` so the compressed-size guard does not fire first.
+        use std::io::Write;
+        let payload = vec![b'A'; 60 * 1024 * 1024]; // 60 MiB, no compression
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("big.bin", opts).unwrap();
+            w.write_all(&payload).unwrap();
+            w.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, 200 * 1024 * 1024)
+            .expect_err("inflating zip must be rejected by cumulative uncompressed cap");
+        assert!(
+            err.to_string().contains("decompressed total"),
+            "expected cumulative uncompressed error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when the zip is rejected for inflation"
+        );
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_too_many_entries() {
+        // Path-explosion bomb: 600 tiny files. The compressed archive is
+        // well under the 50 MiB compressed cap, but the entry count exceeds
+        // MAX_CLAWHUB_ZIP_ENTRIES.
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for i in 0..600usize {
+                w.start_file(format!("file-{i:04}.txt"), opts).unwrap();
+                w.write_all(b"x").unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_CLAWHUB_ZIP_BYTES)
+            .expect_err("entry-count bomb must be rejected");
+        assert!(
+            err.to_string().contains("too many entries"),
+            "expected entry-count error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when the zip is rejected for entry count"
+        );
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_bad_ratio() {
+        // High-ratio bomb: 20 MiB of zeros deflates to a few KiB, giving a
+        // ratio well above MAX_CLAWHUB_ZIP_RATIO (10x). The compressed-size
+        // guard is bypassed with a large `max_bytes` so the ratio guard is
+        // the one that fires.
+        use std::io::Write;
+        let payload = vec![0u8; 20 * 1024 * 1024]; // 20 MiB zeros
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            w.start_file("zeros.bin", opts).unwrap();
+            w.write_all(&payload).unwrap();
+            w.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, 200 * 1024 * 1024)
+            .expect_err("high-ratio zip must be rejected");
+        assert!(
+            err.to_string().contains("compression ratio"),
+            "expected ratio error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when the zip is rejected for ratio"
         );
     }
 
