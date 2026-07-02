@@ -52,6 +52,65 @@ use std::io::{BufRead, ErrorKind, Read, Write};
 /// (e.g. `head -c 10G /dev/zero | zeroclaw chat`) that would otherwise grow
 /// the per-line `String` until the process OOMs.
 const STDIN_LINE_CAP: usize = 1024 * 1024;
+
+/// Result of [`read_capped_line`].
+#[cfg(not(feature = "agent-runtime"))]
+#[derive(Debug)]
+enum CappedLine {
+    /// A full line under the cap, with the trailing `\n` stripped.
+    Line(String),
+    /// The physical line exceeded `cap`. The remainder has been drained
+    /// and must not be used as a prompt.
+    Truncated,
+    /// EOF with no bytes read.
+    Eof,
+}
+
+/// Read a single line from `reader` bounded at `cap` bytes. Returns
+/// the line with the trailing `\n` stripped or [`CappedLine::Truncated`]
+/// when the cap was hit. When truncated, the rest of the physical line
+/// is drained using a fixed-size scratch buffer so the next call starts
+/// at the next line and no unbounded allocation occurs.
+#[cfg(not(feature = "agent-runtime"))]
+fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Result<CappedLine> {
+    let mut raw = Vec::new();
+    let mut limited = reader.take((cap + 1) as u64);
+    std::io::BufRead::read_until(&mut limited, b'\n', &mut raw)?;
+    let truncated = raw.len() > cap;
+    if truncated {
+        let mut inner = limited.into_inner();
+        discard_until_newline(&mut inner)?;
+        return Ok(CappedLine::Truncated);
+    } else if raw.last() == Some(&b'\n') {
+        raw.pop();
+    }
+    if raw.is_empty() {
+        return Ok(CappedLine::Eof);
+    }
+    Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
+}
+
+/// Discard bytes from `reader` until the next `\n` or EOF, using only
+/// `BufRead::fill_buf` / `consume`. This avoids the unbounded allocation
+/// that `read_until(..., &mut Vec::new())` would incur on an oversized
+/// physical line, and it stops exactly at the newline so the next line
+/// is not consumed.
+#[cfg(not(feature = "agent-runtime"))]
+fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+        reader.consume(len);
+    }
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
@@ -3449,49 +3508,34 @@ async fn main() -> Result<()> {
                         // covers in `loop_::read_capped_line`. See
                         // module-level `STDIN_LINE_CAP` for the cap
                         // rationale.
-                        // `Stdin::lock()` returns a `StdinLock<'_>` which is
-                        // unconditionally `BufRead` across all target
-                        // platforms and rustc feature gates; the unlocked
-                        // `Stdin` is only `BufRead` on some platforms /
-                        // under some feature combinations, so wrap the
-                        // read in `lock()` to keep the `no-default-features`
-                        // build (and 32-bit / Windows) green. The lock
-                        // is held for the duration of the REPL loop and
-                        // dropped at scope exit, restoring the original
-                        // behavior of stdin.
-                        let mut stdin = std::io::stdin().lock();
+                        // `Stdin::lock()` is taken once per line so that a
+                        // fresh `Take(cap + 1)` is applied to each physical
+                        // line; a cumulative Take across the whole REPL loop
+                        // would mean that after STDIN_LINE_CAP + 1 total
+                        // bytes all later reads returned EOF (Audacity88
+                        // review #8463).
                         loop {
                             eprint!("> ");
-                            // Per-line Take: limit THIS line only, then
-                            // drain the tail if truncated. Using a
-                            // cumulative Take across the whole REPL loop
-                            // (the previous approach) meant that after
-                            // STDIN_LINE_CAP + 1 total bytes all later
-                            // read_line calls returned EOF (Audacity88
-                            // review #8463).
-                            let mut raw = Vec::new();
-                            std::io::BufRead::read_until(
-                                &mut stdin.by_ref().take((STDIN_LINE_CAP + 1) as u64),
-                                b'\n',
-                                &mut raw,
-                            )?;
-                            if raw.is_empty() {
-                                break;
-                            }
-                            if raw.len() > STDIN_LINE_CAP {
-                                raw.truncate(STDIN_LINE_CAP);
-                                // Drain the rest of the line from stdin
-                                // so oversized input doesn't become
-                                // repeated prompts.
-                                let _ = std::io::BufRead::read_until(
-                                    &mut stdin,
-                                    b'\n',
-                                    &mut Vec::new(),
-                                )?;
-                            } else if raw.last() == Some(&b'\n') {
-                                raw.pop();
-                            }
-                            let line = String::from_utf8_lossy(&raw).into_owned();
+                            let line = {
+                                let stdin = std::io::stdin().lock();
+                                match read_capped_line(stdin, STDIN_LINE_CAP) {
+                                    Ok(CappedLine::Eof) => break,
+                                    Ok(CappedLine::Line(s)) => s,
+                                    Ok(CappedLine::Truncated) => {
+                                        // i18n-exempt: no-runtime fallback lacks the Fluent catalogue.
+                                        eprintln!(
+                                            "\nWarning: input line exceeds {} bytes and was discarded.",
+                                            STDIN_LINE_CAP
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        // i18n-exempt: no-runtime fallback lacks the Fluent catalogue.
+                                        eprintln!("\nError reading input: {e}\n");
+                                        break;
+                                    }
+                                }
+                            };
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
                                     .simple_chat(line.trim(), model_name, Some(final_temperature))
