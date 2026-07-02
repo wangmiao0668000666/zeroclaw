@@ -57,8 +57,10 @@ const MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 /// Maximum per-archive uncompressed/compressed ratio. A single entry that
 /// deflate-compresses 100x is the canonical zip bomb shape; the global cap
 /// on uncompressed bytes would also catch it, but the ratio guard rejects
-/// the archive before any write happens.
-const MAX_CLAWHUB_ZIP_RATIO: u64 = 10;
+/// the archive before any write happens. The threshold is set at 50x to
+/// avoid false positives on legitimately compressible text (JSON, Markdown,
+/// YAML) while still catching canonical zip bombs (which achieve 1000x+).
+const MAX_CLAWHUB_ZIP_RATIO: u64 = 50;
 /// Per-entry uncompressed byte cap. Mirrors
 /// [`MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES`] so a single lying entry cannot
 /// bypass the cumulative cap by claiming a small declared size in the
@@ -2280,7 +2282,19 @@ fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()>
         let declared_compressed = entry.compressed_size();
 
         // Cumulative uncompressed cap. Checked before any write so a bomb
-        // that inflates past 50 MiB never touches disk.
+        // that inflates past 50 MiB never touches disk. The authoritative
+        // count is the bytes actually copied below, but the declared-size
+        // pre-check rejects obviously-oversize honest archives without
+        // touching the filesystem.
+        let remaining_archive_budget =
+            MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES.saturating_sub(cumulative_uncompressed);
+        if remaining_archive_budget == 0 {
+            cleanup_failed_extract_dest(dest);
+            anyhow::bail!(
+                "skill zip rejected: decompressed total would exceed {} bytes",
+                MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES
+            );
+        }
         let new_cumulative = cumulative_uncompressed.saturating_add(declared_size);
         if new_cumulative > MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES {
             cleanup_failed_extract_dest(dest);
@@ -2315,7 +2329,6 @@ fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()>
             }
         }
 
-        cumulative_uncompressed = new_cumulative;
         cumulative_compressed = cumulative_compressed.saturating_add(declared_compressed);
 
         let out_path = dest.join(&raw_name);
@@ -2335,26 +2348,34 @@ fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()>
             )
         })?;
 
-        // Guard 3: per-entry read cap. Wrap the entry reader with `take`
-        // so a central-directory size declaration that understates the real
-        // payload cannot blow the cumulative cap. The take bound is
-        // generous (matches the cumulative cap) so honest archives are
-        // unaffected; the cap is enforced via `io::copy` returning fewer
-        // bytes than `take` allowed and a follow-up read of zero bytes.
-        let mut bounded = (&mut entry).take(MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES);
+        // Guard 3: per-entry read cap, further bounded by the remaining
+        // archive-wide uncompressed budget. `Read::take` ensures the copy
+        // stops at the tighter of the two budgets, and the canary read after
+        // `io::copy` catches entries whose actual uncompressed size exceeds
+        // either budget. This prevents a multi-entry attack where each entry
+        // declares a small central-directory size but collectively writes
+        // past the archive cap.
+        let entry_budget = MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES.min(remaining_archive_budget);
+        let mut bounded = (&mut entry).take(entry_budget);
         let copied = std::io::copy(&mut bounded, &mut out_file).with_context(|| {
             format!(
                 "failed to write extracted file: {}",
                 out_path.display().to_string()
             )
         })?;
-        if copied > MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES {
+        let inner = bounded.into_inner();
+        let mut canary = [0u8; 1];
+        if inner.read(&mut canary)? > 0 {
             cleanup_failed_extract_dest(dest);
             anyhow::bail!(
-                "skill zip rejected: entry {raw_name:?} exceeded per-entry byte cap of {}",
-                MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES
+                "skill zip rejected: entry {raw_name:?} exceeded per-entry byte cap of {} \
+                 or archive uncompressed cap of {}",
+                MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES,
+                MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES
             );
         }
+
+        cumulative_uncompressed = cumulative_uncompressed.saturating_add(copied);
     }
 
     // Final ratio cross-check on the whole archive, not just per-entry.
@@ -3104,6 +3125,118 @@ mod registry_tests {
         assert!(
             !dest.exists(),
             "dest must not be created when the zip is rejected for ratio"
+        );
+    }
+
+    /// Regression for Guard 3 (per-entry read cap). A zip entry whose central
+    /// directory declares a tiny uncompressed size but whose actual payload is
+    /// larger than MAX_CLAWHUB_ZIP_PER_ENTRY_BYTES must be rejected, not silently
+    /// truncated on disk.
+    #[test]
+    fn test_extract_zip_secure_rejects_lying_declared_size() {
+        use std::io::Write;
+        // 60 MiB payload, but we will patch the central directory to claim 1 byte.
+        let payload = vec![b'A'; 60 * 1024 * 1024];
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("big.bin", opts).unwrap();
+            w.write_all(&payload).unwrap();
+            w.finish().unwrap();
+        }
+
+        // Lie about the declared uncompressed size so the cumulative cap is not
+        // triggered and only the per-entry canary read can catch the bomb.
+        patch_zip_central_directory_uncompressed_size(&mut buf, 1);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, 200 * 1024 * 1024)
+            .expect_err("lying declared size must be rejected by per-entry cap");
+        assert!(
+            err.to_string().contains("per-entry byte cap"),
+            "expected per-entry cap error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when lying declared size is rejected"
+        );
+    }
+
+    /// Regression for the cumulative archive cap. Multiple entries can each
+    /// declare a small uncompressed size while their actual payloads sum past
+    /// `MAX_CLAWHUB_ZIP_UNCOMPRESSED_BYTES`. The cumulative guard must count
+    /// bytes actually copied, not declared sizes.
+    #[test]
+    fn test_extract_zip_secure_rejects_multi_entry_lying_declared_size() {
+        use std::io::Write;
+        const ENTRY_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
+        const ENTRY_COUNT: usize = 6; // 60 MiB total > 50 MiB cap
+        const LIED_SIZE: u32 = 8 * 1024 * 1024; // 48 MiB declared total < 50 MiB cap
+
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for i in 0..ENTRY_COUNT {
+                let payload = vec![b'A'; ENTRY_SIZE];
+                w.start_file(format!("big{i}.bin"), opts).unwrap();
+                w.write_all(&payload).unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        patch_all_zip_central_directory_uncompressed_sizes(&mut buf, LIED_SIZE);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, 200 * 1024 * 1024)
+            .expect_err("multi-entry lying declared sizes must be rejected by archive cap");
+        assert!(
+            err.to_string().contains("archive uncompressed cap")
+                || err.to_string().contains("decompressed total"),
+            "expected archive cap error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when archive cap is exceeded"
+        );
+    }
+
+    /// Overwrite the uncompressed-size field in the first central-directory
+    /// header of a zip file. Used by tests to simulate a lying declared size.
+    fn patch_zip_central_directory_uncompressed_size(zip: &mut [u8], new_size: u32) {
+        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
+            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
+                // uncompressed size is at offset 24 from the central-directory
+                // header signature.
+                let start = i + 24;
+                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
+                return;
+            }
+        }
+        panic!("central directory signature not found in test zip");
+    }
+
+    /// Overwrite the uncompressed-size field in every central-directory header
+    /// of a zip file. Used by tests that need every entry to lie about its size.
+    fn patch_all_zip_central_directory_uncompressed_sizes(zip: &mut [u8], new_size: u32) {
+        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        let mut patched = 0;
+        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
+            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
+                let start = i + 24;
+                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
+                patched += 1;
+            }
+        }
+        assert!(
+            patched > 0,
+            "central directory signature not found in test zip"
         );
     }
 
