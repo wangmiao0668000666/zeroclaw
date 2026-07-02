@@ -34,6 +34,24 @@ pub enum DaemonExit {
 /// Default grace period (seconds) before ephemeral shutdown after last client disconnects.
 const EPHEMERAL_GRACE_SECS: u64 = 1;
 
+/// Test-only sentinel for the scheduler cooperative-shutdown path through
+/// `daemon::run`. `spawn_component_supervisor` sets this to `true` only when
+/// the scheduler component takes the cancel-aware clean-return branch. The
+/// daemon-boundary regression test in `#[cfg(test)]` resets and asserts it.
+#[cfg(test)]
+static SCHEDULER_CLEAN_SHUTDOWN_OBSERVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn reset_scheduler_clean_shutdown_observed() {
+    SCHEDULER_CLEAN_SHUTDOWN_OBSERVED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn scheduler_clean_shutdown_observed() -> bool {
+    SCHEDULER_CLEAN_SHUTDOWN_OBSERVED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 async fn wait_for_exit_signal(
     mut reload_rx: tokio::sync::watch::Receiver<bool>,
     ephemeral: bool,
@@ -898,6 +916,11 @@ where
                     // shutdown.
                     if cancel.is_cancelled() {
                         crate::health::mark_component_ok(name);
+                        #[cfg(test)]
+                        if name == "scheduler" {
+                            SCHEDULER_CLEAN_SHUTDOWN_OBSERVED
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(
@@ -2523,23 +2546,17 @@ mod tests {
     ///
     /// The reviewer asked specifically for evidence that the supervisor's
     /// `cancel.is_cancelled()` branch runs through the real daemon
-    /// shutdown loop. The supervisor's observable state lives in the
-    /// `crate::health::snapshot_json()` output:
-    ///   - `restart_count == 0` proves the supervisor took the
-    ///     clean-shutdown `return` path, because every other supervisor
-    ///     branch (unexpected `Ok(())` after a normal exit, or `Err`)
-    ///     calls `bump_component_restart`. Only the cancel-aware
-    ///     `return` skips the bump.
-    ///   - `status == "ok"` (and `last_error == null`) confirms the
-    ///     scheduler's cancel arm ran, since that arm calls
-    ///     `crate::health::mark_component_ok(SCHEDULER_COMPONENT)`
-    ///     before returning `Ok(())`. The supervisor's `mark_component_ok`
-    ///     is also called in the clean path.
+    /// shutdown loop. The health snapshot alone (`status == "ok"`,
+    /// `restart_count == 0`, `last_error == null`) is not sufficient,
+    /// because aborting the supervisor task before it observes the
+    /// component's `Ok(())` leaves the pre-await health state unchanged.
     ///
-    /// The scheduler is the only component whose `Ok(())` return is
-    /// gated on its cancellation arm, so observing
-    /// `restart_count == 0` here means the cooperative cancel arm was
-    /// actually exercised through the real `daemon::run` shutdown path.
+    /// To prove the clean-return branch actually ran, this test uses a
+    /// test-only sentinel that `spawn_component_supervisor` sets only
+    /// when the scheduler component reaches the cancel-aware `return`.
+    /// If the grace window is removed, or if the supervisor handle is
+    /// aborted before the scheduler returns `Ok(())`, the sentinel stays
+    /// `false` and the test fails.
     #[tokio::test]
     async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
         use tokio::time::{Duration, timeout};
@@ -2552,6 +2569,8 @@ mod tests {
         // waiting for the next tick (5s, the MIN_POLL_SECONDS floor).
         // We trigger reload well within that window so the cancel arm
         // wins deterministically.
+
+        reset_scheduler_clean_shutdown_observed();
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
@@ -2579,10 +2598,16 @@ mod tests {
         assert_eq!(exit, DaemonExit::Reload);
 
         // The scheduler's cooperative cancel arm must have fired
-        // through the real `daemon::run` shutdown loop. See this
-        // function's doc comment for why `restart_count == 0` is the
-        // load-bearing assertion: every supervisor branch except the
-        // cancel-aware `return` calls `bump_component_restart`.
+        // through the real `daemon::run` shutdown loop, and the
+        // supervisor must have observed the resulting `Ok(())` and
+        // taken the cancel-aware clean-return branch. The sentinel is
+        // only set in that specific branch.
+        assert!(
+            scheduler_clean_shutdown_observed(),
+            "scheduler supervisor must take the cancel-aware clean-return branch; \
+             aborting the supervisor before it observes Ok(()) leaves this sentinel false"
+        );
+
         let snapshot = crate::health::snapshot_json();
         let component = &snapshot["components"]["scheduler"];
         assert_eq!(
