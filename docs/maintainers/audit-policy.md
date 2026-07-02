@@ -28,9 +28,17 @@ The result is that `cargo audit` can fail with advisories
 configured against the same `Cargo.lock`. The drift between the two
 tools is tracked in **#8519**.
 
-When the two tools disagree, the `cargo-audit` step in
-`.github/workflows/ci.yml` is the binding CI gate. `cargo-deny` runs
-informally and emits warnings, not errors.
+When the two tools disagree, the Security job in
+`.github/workflows/ci.yml` runs **both** `cargo audit` and
+`cargo deny check advisories` as hard gates. A non-zero exit from
+either tool blocks the PR.
+
+The difference between the tools is **scope**, not enforcement:
+`cargo audit` reports every advisory touching the lockfile, while
+`cargo deny` only reports advisories for crates in the resolved
+workspace graph. Use the narrower `cargo deny` result to confirm an
+advisory is not actually pulled in, but treat both CI failures as
+blocking.
 
 ---
 
