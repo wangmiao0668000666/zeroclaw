@@ -976,9 +976,10 @@ pub fn all_tools_with_runtime(
             )
             .with_subagent_caller(is_subagent_caller),
         ),
-        Arc::new(SendMessageToPeerTool::new(
+        Arc::new(SendMessageToPeerTool::new_with_live_config(
             Arc::clone(&root_config_shared),
             agent_alias,
+            live_config.clone(),
         )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
