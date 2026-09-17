@@ -11,6 +11,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
@@ -214,26 +216,26 @@ impl Tool for SendMessageToPeerTool {
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
                 let turn = async move {
-                    if let Some(live_config) = live_config {
-                        crate::agent::loop_::process_message_with_live_config(
-                            cfg,
-                            live_config,
-                            &turn_recipient_alias,
-                            &body,
-                            None,
-                            zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                        )
-                        .await
-                    } else {
-                        crate::agent::loop_::process_message(
-                            cfg,
-                            &turn_recipient_alias,
-                            &body,
-                            None,
-                            zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                        )
-                        .await
-                    }
+                    let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
+                        if let Some(live_config) = live_config {
+                            Box::pin(crate::agent::loop_::process_message_with_live_config(
+                                cfg,
+                                live_config,
+                                &turn_recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                            ))
+                        } else {
+                            Box::pin(crate::agent::loop_::process_message(
+                                cfg,
+                                &turn_recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                            ))
+                        };
+                    turn.await
                 };
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {
