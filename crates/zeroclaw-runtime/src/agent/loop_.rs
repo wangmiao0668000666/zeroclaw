@@ -17991,17 +17991,18 @@ Let me check the result."#;
             2,
             "the second model call should receive the denied tool result"
         );
-        let requests = provider_state
-            .requests
-            .lock()
-            .expect("provider requests lock should be valid");
-        assert!(
-            requests.iter().any(|body| body
-                .to_string()
-                .contains("file_download.allowed_private_hosts")),
-            "model provider should receive the live-policy denial result, got {requests:?}"
-        );
-        drop(requests);
+        {
+            let requests = provider_state
+                .requests
+                .lock()
+                .expect("provider requests lock should be valid");
+            assert!(
+                requests.iter().any(|body| body
+                    .to_string()
+                    .contains("file_download.allowed_private_hosts")),
+                "model provider should receive the live-policy denial result, got {requests:?}"
+            );
+        }
         assert!(
             !config
                 .agent_workspace_dir("live-file-download-agent")
