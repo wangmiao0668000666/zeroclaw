@@ -195,9 +195,12 @@ fn extract_download_url_host(url: &str) -> anyhow::Result<String> {
         .host_str()
         .filter(|host| !host.is_empty())
         .ok_or_else(|| anyhow::Error::msg("URL must include a valid host"))?;
-    if host.contains(':') {
-        anyhow::bail!("IPv6 hosts are not supported in file_download endpoint URLs");
-    }
+    // `Url::host_str()` serializes IPv6 literals with brackets. The resolver,
+    // policy guard, and `IpAddr` checks all consume the canonical bare address.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|bare| bare.strip_suffix(']'))
+        .unwrap_or(host);
 
     Ok(host.to_ascii_lowercase())
 }
@@ -915,6 +918,29 @@ mod tests {
 
         assert!(err.contains("127.0.0.1"));
         assert!(err.contains("file_download.allowed_private_hosts"));
+    }
+
+    #[tokio::test]
+    async fn validate_endpoint_host_accepts_public_ipv6_literal() {
+        let tmp = TempDir::new().unwrap();
+        let endpoint = "https://[2606:4700:4700::1111]/download";
+        let tool = FileDownloadTool::new(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            cfg(Some(endpoint.into())),
+        );
+
+        let (transport_host, resolved) = tool
+            .validate_endpoint_host(endpoint)
+            .await
+            .expect("public IPv6 literals should be validated and pinned");
+
+        assert_eq!(transport_host, "2606:4700:4700::1111");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].ip(),
+            "2606:4700:4700::1111".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(resolved[0].port(), 443);
     }
 
     #[tokio::test]
