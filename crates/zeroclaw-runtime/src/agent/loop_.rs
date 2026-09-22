@@ -3149,7 +3149,7 @@ async fn process_message_inner(
             None,
             sop_engine,
             sop_audit,
-            None,
+            live_config.clone(),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -17843,6 +17843,181 @@ Let me check the result."#;
             "process_message_with_live_config must pass a live-config-backed SopStepReassembly \
              handle into agent_turn; observed {seen:?}; process_message result: {live_result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn process_message_with_live_config_file_download_observes_revoked_private_host() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path, query_param},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, FileDownloadConfig, RiskProfileConfig};
+
+        #[derive(Clone)]
+        struct ProviderState {
+            calls: Arc<AtomicUsize>,
+            requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        async fn respond_with_file_download_then_done(
+            State(state): State<ProviderState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state
+                .requests
+                .lock()
+                .expect("provider request capture lock should be valid")
+                .push(body);
+            let call = state.calls.fetch_add(1, Ordering::SeqCst);
+            Json(if call == 0 {
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-file-download",
+                                "type": "function",
+                                "function": {
+                                    "name": "file_download",
+                                    "arguments": "{\"document_id\":\"doc-1\",\"dest_path\":\"out.bin\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                })
+            })
+        }
+
+        let tmp = TempDir::new().expect("temp dir");
+        let download_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .and(query_param("document_id", "doc-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"should-not-download"))
+            .expect(0)
+            .mount(&download_server)
+            .await;
+
+        let provider_state = ProviderState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider listener should bind");
+        let provider_addr = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(respond_with_file_download_then_done),
+            )
+            .with_state(provider_state.clone());
+        let provider_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            file_download: FileDownloadConfig {
+                url: Some(format!("{}/download", download_server.uri())),
+                allowed_private_hosts: vec!["127.0.0.1".into()],
+                ..FileDownloadConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{provider_addr}"));
+        provider.native_tools = Some(true);
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "full".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                allowed_tools: vec!["file_download".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "live-file-download-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "full".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        std::fs::create_dir_all(config.agent_workspace_dir("live-file-download-agent"))
+            .expect("agent workspace directory");
+
+        let live_config = Arc::new(RwLock::new(config.clone()));
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let result = super::process_message_with_live_config(
+            config.clone(),
+            live_config,
+            "live-file-download-agent",
+            "download the private document",
+            Some("session"),
+            TurnOrigin::Channel,
+        )
+        .await
+        .expect("process_message_with_live_config should complete");
+
+        provider_server.abort();
+        assert_eq!(result, "done");
+        assert_eq!(
+            provider_state.calls.load(Ordering::SeqCst),
+            2,
+            "the second model call should receive the denied tool result"
+        );
+        let requests = provider_state
+            .requests
+            .lock()
+            .expect("provider requests lock should be valid");
+        assert!(
+            requests.iter().any(|body| body
+                .to_string()
+                .contains("file_download.allowed_private_hosts")),
+            "model provider should receive the live-policy denial result, got {requests:?}"
+        );
+        drop(requests);
+        assert!(
+            !config
+                .agent_workspace_dir("live-file-download-agent")
+                .join("out.bin")
+                .exists(),
+            "revoked private-host policy must fail before writing the download"
+        );
+        assert!(
+            download_server
+                .received_requests()
+                .await
+                .unwrap()
+                .is_empty(),
+            "revoked private-host policy must fail before contacting the private endpoint"
+        );
+        download_server.verify().await;
     }
 
     #[tokio::test]
